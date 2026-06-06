@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" role="img" aria-label="Default video thumbnail">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#09090b"/>
+      <stop offset="0.52" stop-color="#20102f"/>
+      <stop offset="1" stop-color="#050505"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="48%" r="46%">
+      <stop offset="0" stop-color="#d8b35a" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#d8b35a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <circle cx="640" cy="346" r="330" fill="url(#glow)" filter="url(#soft)"/>
+  <path d="M0 610c170-62 300-81 430-50 148 35 263 31 396-8 170-50 308-34 454 34v134H0z" fill="#111113" opacity="0.85"/>
+  <rect x="484" y="205" width="312" height="230" rx="34" fill="#ffffff" opacity="0.08" stroke="#d8b35a" stroke-opacity="0.42" stroke-width="4"/>
+  <path d="M610 264v112l99-56z" fill="#f7d982"/>
+  <text x="640" y="510" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="800" fill="#f7d982">Premium Video</text>
+  <text x="640" y="562" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="600" fill="#f5f5f5" opacity="0.72">Thumbnail coming soon</text>
+</svg>
