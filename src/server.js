@@ -164,7 +164,8 @@ app.use(
 app.use(
   "/uploads/site",
   express.static(siteUploadDir, {
-    maxAge: "1h",
+    immutable: true,
+    maxAge: "30d",
   }),
 );
 
@@ -174,6 +175,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, unique: true, required: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
     role: { type: String, enum: ["user", "admin"], default: "user" },
+    isBlocked: { type: Boolean, default: false },
     isPremium: { type: Boolean, default: false },
     plan: { type: String, default: "" },
     premiumSince: { type: Date },
@@ -365,7 +367,12 @@ app.get("/api/admin/catalog", requireAdmin, async (_request, response, next) => 
 
 app.post("/api/admin/catalog", requireAdmin, async (request, response, next) => {
   try {
-    throw httpError(403, "Catalog is locked to New, Trending, and Popular.");
+    await createCatalogItem(readCatalogItemInput(request.body));
+    const items = await getCatalogItems();
+    response.status(201).json({
+      catalog: catalogFromItems(items),
+      items: items.map(serializeCatalogItem),
+    });
   } catch (error) {
     next(error);
   }
@@ -474,12 +481,12 @@ app.post("/api/admin/videos", requireAdmin, upload.fields(getUploadFields()), as
         ...payload,
       };
       memory.videos.unshift(video);
-      response.status(201).json({ video });
-      return;
-    }
+    response.status(201).json({ video: serializeAdminVideo(video, request) });
+    return;
+  }
 
-    const video = await Video.create(payload);
-    response.status(201).json({ video });
+  const video = await Video.create(payload);
+  response.status(201).json({ video: serializeAdminVideo(video.toObject(), request) });
   } catch (error) {
     next(error);
   }
@@ -494,7 +501,7 @@ app.patch("/api/admin/videos/:id", requireAdmin, upload.fields(getUploadFields()
       const index = memory.videos.findIndex((video) => video.id === request.params.id);
       if (index === -1) throw httpError(404, "Video not found.");
       memory.videos[index] = { ...memory.videos[index], ...payload };
-      response.json({ video: memory.videos[index] });
+      response.json({ video: serializeAdminVideo(memory.videos[index], request) });
       return;
     }
 
@@ -503,7 +510,7 @@ app.patch("/api/admin/videos/:id", requireAdmin, upload.fields(getUploadFields()
       runValidators: true,
     });
     if (!video) throw httpError(404, "Video not found.");
-    response.json({ video });
+    response.json({ video: serializeAdminVideo(video.toObject(), request) });
   } catch (error) {
     next(error);
   }
@@ -538,7 +545,8 @@ app.get("/api/admin/users", requireAdmin, async (request, response, next) => {
       memory.users.forEach(refreshExpiredSubscription);
       const users = memory.users
         .filter((user) => matchesUserSearch(user, search))
-        .map(publicUser)
+        .map(safePublicUser)
+        .filter(Boolean)
         .slice(0, 100);
       response.json({ users });
       return;
@@ -553,9 +561,18 @@ app.get("/api/admin/users", requireAdmin, async (request, response, next) => {
         }
       : {};
 
-    await expireDatabaseSubscriptions();
-    const users = await User.find(query).sort({ createdAt: -1 }).limit(100).lean();
-    response.json({ users: users.map(publicUser) });
+    try {
+      await expireDatabaseSubscriptions();
+    } catch (error) {
+      console.warn("Could not expire old subscriptions before listing users:", error.message);
+    }
+    let users = [];
+    try {
+      users = await User.find(query).sort({ createdAt: -1 }).limit(100).lean();
+    } catch (error) {
+      console.warn("Could not list users:", error.message);
+    }
+    response.json({ users: users.map(safePublicUser).filter(Boolean) });
   } catch (error) {
     next(error);
   }
@@ -580,6 +597,51 @@ app.patch("/api/admin/users/:id/premium", requireAdmin, async (request, response
     setPremiumState(user, isPremium, plan);
     await user.save();
     response.json({ user: publicUser(user) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/admin/users/:id/block", requireAdmin, async (request, response, next) => {
+  try {
+    const isBlocked = Boolean(request.body?.isBlocked);
+
+    if (!isDbReady()) {
+      const user = memory.users.find((item) => item.id === request.params.id);
+      if (!user) throw httpError(404, "User not found.");
+      if (user.role === "admin") throw httpError(400, "Admin account cannot be blocked.");
+      user.isBlocked = isBlocked;
+      response.json({ user: publicUser(user) });
+      return;
+    }
+
+    const user = await User.findById(request.params.id);
+    if (!user) throw httpError(404, "User not found.");
+    if (user.role === "admin") throw httpError(400, "Admin account cannot be blocked.");
+    user.isBlocked = isBlocked;
+    await user.save();
+    response.json({ user: publicUser(user) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next) => {
+  try {
+    if (!isDbReady()) {
+      const index = memory.users.findIndex((item) => item.id === request.params.id);
+      if (index === -1) throw httpError(404, "User not found.");
+      if (memory.users[index].role === "admin") throw httpError(400, "Admin account cannot be deleted.");
+      memory.users.splice(index, 1);
+      response.json({ ok: true });
+      return;
+    }
+
+    const user = await User.findById(request.params.id);
+    if (!user) throw httpError(404, "User not found.");
+    if (user.role === "admin") throw httpError(400, "Admin account cannot be deleted.");
+    await User.deleteOne({ _id: user._id });
+    response.json({ ok: true });
   } catch (error) {
     next(error);
   }
@@ -651,6 +713,7 @@ app.post("/api/auth/register", async (request, response, next) => {
         email,
         passwordHash,
         role: isAdminEmail(email) ? "admin" : "user",
+        isBlocked: false,
         isPremium: false,
         plan: "",
       };
@@ -682,6 +745,10 @@ app.post("/api/auth/login", async (request, response, next) => {
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       response.status(401).json({ message: "Invalid email or password." });
+      return;
+    }
+    if (user.isBlocked) {
+      response.status(403).json({ message: "Your account is blocked." });
       return;
     }
 
@@ -864,6 +931,9 @@ function readVideoInput(body, options = { partial: false }) {
     if (body?.premiumOnly !== undefined) {
       payload.premiumOnly = Boolean(body.premiumOnly);
     }
+    if (body?.views !== undefined) {
+      payload.views = normalizeViews(body.views);
+    }
     if (payload.status && !["pending", "approved", "rejected"].includes(payload.status)) {
       throw httpError(400, "Valid status is required.");
     }
@@ -884,6 +954,7 @@ function readVideoInput(body, options = { partial: false }) {
     videoPathHd: String(body?.videoPathHd || "").trim(),
     videoPathSd: String(body?.videoPathSd || "").trim(),
     duration: String(body?.duration || "00:00").trim(),
+    views: normalizeViews(body?.views),
     status: String(body?.status || "approved").trim(),
     premiumOnly: body?.premiumOnly === undefined ? true : Boolean(body.premiumOnly),
   };
@@ -896,6 +967,13 @@ function readVideoInput(body, options = { partial: false }) {
   }
 
   return fields;
+}
+
+function normalizeViews(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const views = Number(value);
+  if (!Number.isFinite(views) || views < 0) throw httpError(400, "Valid views count is required.");
+  return Math.round(views);
 }
 
 function readAuthInput(body, options = { requireName: true }) {
@@ -1016,6 +1094,7 @@ async function deleteCatalogItem(id) {
   if (!isDbReady()) {
     const item = memory.catalogItems.find((entry) => entry.id === id);
     if (!item) throw httpError(404, "Catalog item not found.");
+    if (isDefaultCatalogItem(item)) throw httpError(400, "Default category cannot be deleted.");
 
     const remaining = memory.catalogItems.filter(
       (entry) => entry.kind === item.kind && entry.id !== id,
@@ -1030,6 +1109,7 @@ async function deleteCatalogItem(id) {
 
   const item = await CatalogItem.findById(id).lean();
   if (!item) throw httpError(404, "Catalog item not found.");
+  if (isDefaultCatalogItem(item)) throw httpError(400, "Default category cannot be deleted.");
 
   const remaining = await CatalogItem.find({ kind: item.kind, _id: { $ne: item._id } })
     .sort({ sortOrder: 1, name: 1 })
@@ -1063,6 +1143,12 @@ function buildDefaultCatalogEntries() {
       sortOrder: index,
     })),
   ];
+}
+
+function isDefaultCatalogItem(item) {
+  if (!item) return false;
+  const list = item.kind === "section" ? defaultCatalog.sections : defaultCatalog.categories;
+  return list.map(catalogSlug).includes(item.slug || catalogSlug(item.name));
 }
 
 function catalogSlug(name) {
@@ -1195,6 +1281,7 @@ function setPremiumState(user, isPremium, plan = null) {
 
 function isPremiumActive(user) {
   if (!user) return false;
+  if (user.isBlocked) return false;
   if (user.role === "admin") return true;
   if (!user.isPremium) return false;
   if (!user.premiumUntil) return true;
@@ -1271,6 +1358,13 @@ function getSubscriptionDays(user) {
   return Math.round((end - start) / (1000 * 60 * 60 * 24));
 }
 
+function getRemainingSubscriptionDays(user) {
+  if (!user?.premiumUntil || !isPremiumActive(user)) return 0;
+  const end = new Date(user.premiumUntil).getTime();
+  if (!Number.isFinite(end)) return 0;
+  return Math.max(0, Math.ceil((end - Date.now()) / (1000 * 60 * 60 * 24)));
+}
+
 async function findVideoById(id) {
   if (!id) return null;
   if (!isDbReady()) {
@@ -1286,6 +1380,10 @@ async function requireAuth(request, response, next) {
       response.status(401).json({ message: "Authentication required." });
       return;
     }
+    if (user.isBlocked) {
+      response.status(403).json({ message: "Your account is blocked." });
+      return;
+    }
     request.user = user;
     next();
   } catch (error) {
@@ -1298,6 +1396,10 @@ async function requireAdmin(request, response, next) {
     const user = await readUserFromToken(request);
     if (!user) {
       response.status(401).json({ message: "Authentication required." });
+      return;
+    }
+    if (user.isBlocked) {
+      response.status(403).json({ message: "Your account is blocked." });
       return;
     }
     if (user.role !== "admin") {
@@ -1316,6 +1418,10 @@ async function requirePremium(request, response, next) {
     const user = await readUserFromToken(request);
     if (!user) {
       response.status(401).json({ message: "Authentication required." });
+      return;
+    }
+    if (user.isBlocked) {
+      response.status(403).json({ message: "Your account is blocked." });
       return;
     }
     if (!isPremiumActive(user)) {
@@ -1343,16 +1449,29 @@ async function readUserFromToken(request) {
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (!token) return null;
 
-  const payload = jwt.verify(token, jwtSecret);
+  let payload;
+  try {
+    payload = jwt.verify(token, jwtSecret);
+  } catch {
+    return null;
+  }
+  if (!payload?.sub) return null;
+
   if (!isDbReady()) {
     const user = memory.users.find((item) => item.id === payload.sub) || null;
     if (user) refreshExpiredSubscription(user);
     return user;
   }
 
-  const user = await User.findById(payload.sub);
-  if (user) await refreshExpiredSubscription(user);
-  return user;
+  if (!mongoose.isValidObjectId(payload.sub)) return null;
+
+  try {
+    const user = await User.findById(payload.sub);
+    if (user) await refreshExpiredSubscription(user);
+    return user;
+  } catch {
+    return null;
+  }
 }
 
 function createSession(user) {
@@ -1369,19 +1488,54 @@ function createSession(user) {
 function publicUser(user) {
   const activePlan = getPremiumPlan(user.plan, { fallback: null });
   const subscriptionDays = getSubscriptionDays(user);
+  const remainingDays = getRemainingSubscriptionDays(user);
   const premiumActive = isPremiumActive(user);
+  const planName = getPublicPlanName(user, activePlan, subscriptionDays);
   return {
     id: String(user._id || user.id),
     name: user.name,
     email: user.email,
     role: user.role || "user",
+    isBlocked: Boolean(user.isBlocked),
     isPremium: premiumActive,
     plan: user.plan || "",
-    planName: activePlan ? formatPlanName(user.plan, subscriptionDays || activePlan.durationDays) : "",
+    planName,
     premiumSince: user.premiumSince || null,
     premiumUntil: user.premiumUntil || null,
     subscriptionDays,
+    remainingDays,
   };
+}
+
+function safePublicUser(user) {
+  try {
+    return publicUser(user);
+  } catch (error) {
+    console.warn("Could not serialize user:", error.message);
+    if (!user) return null;
+    return {
+      id: String(user._id || user.id || ""),
+      name: user.name || "Member",
+      email: user.email || "",
+      role: user.role || "user",
+      isBlocked: Boolean(user.isBlocked),
+      isPremium: false,
+      plan: user.plan || "",
+      planName: "",
+      premiumSince: user.premiumSince || null,
+      premiumUntil: user.premiumUntil || null,
+      subscriptionDays: 0,
+      remainingDays: 0,
+    };
+  }
+}
+
+function getPublicPlanName(user, activePlan, subscriptionDays) {
+  if (user.role === "admin") return "Admin Access";
+  if (!isPremiumActive(user)) return "";
+  if (activePlan) return formatPlanName(user.plan, subscriptionDays || activePlan.durationDays);
+  if (subscriptionDays) return formatPlanName(user.plan, subscriptionDays);
+  return "Premium";
 }
 
 async function ensureMemoryAdmin() {
@@ -1448,20 +1602,9 @@ async function ensurePaymentSettings() {
 
 async function ensureCatalogItems() {
   const entries = buildDefaultCatalogEntries();
-  const allowed = {
-    category: new Set(defaultCatalog.categories.map(catalogSlug)),
-    section: new Set(defaultCatalog.sections.map(catalogSlug)),
-  };
-
-  await CatalogItem.deleteMany({
-    $or: [
-      { kind: "category", slug: { $nin: [...allowed.category] } },
-      { kind: "section", slug: { $nin: [...allowed.section] } },
-    ],
-  });
 
   await Video.updateMany(
-    { category: { $nin: defaultCatalog.categories } },
+    { $or: [{ category: { $exists: false } }, { category: "" }] },
     { $set: { category: defaultCatalog.categories[0] } },
   );
   await Video.updateMany(
@@ -1537,7 +1680,13 @@ async function getCatalogItems() {
   if (!isDbReady()) {
     return [...memory.catalogItems].sort(sortCatalogItems);
   }
-  return CatalogItem.find().sort({ kind: 1, sortOrder: 1, name: 1 }).lean();
+  try {
+    const items = await CatalogItem.find().sort({ kind: 1, sortOrder: 1, name: 1 }).lean();
+    return items.length ? items : buildDefaultCatalogItems();
+  } catch (error) {
+    console.warn("Could not load catalog items:", error.message);
+    return buildDefaultCatalogItems();
+  }
 }
 
 function catalogFromItems(items) {
