@@ -158,7 +158,8 @@ app.use(
 app.use(
   "/uploads/payments",
   express.static(paymentUploadDir, {
-    maxAge: "1h",
+    immutable: true,
+    maxAge: "30d",
   }),
 );
 app.use(
@@ -671,11 +672,11 @@ app.patch(
 
       if (upiQr) {
         payload.qrImagePath = upiQr.filename;
-        payload.qrImageUrl = `/uploads/payments/${upiQr.filename}`;
+        payload.qrImageUrl = await fileToDataUrl(upiQr);
       }
       if (heroImage) {
         payload.heroImagePath = heroImage.filename;
-        payload.heroImageUrl = `/uploads/site/${heroImage.filename}`;
+        payload.heroImageUrl = await fileToDataUrl(heroImage);
       }
 
       if (!isDbReady()) {
@@ -875,7 +876,7 @@ app.use((error, _request, response, _next) => {
 
 async function start() {
   await ensureMemoryAdmin();
-  memory.videos = demoVideos.map((video) => ({ status: "approved", ...video }));
+  memory.videos = [];
 
   const uri = process.env.MONGODB_URI;
   if (uri) {
@@ -1589,9 +1590,13 @@ async function ensureDatabaseAdmin() {
 }
 
 async function ensureDatabaseVideos() {
-  const count = await Video.countDocuments();
-  if (count > 0) return;
-  await Video.insertMany(demoVideos);
+  await Video.deleteMany({
+    title: { $in: demoVideos.map((video) => video.title) },
+    $or: [
+      { videoUrl: { $regex: "coverr\\.co|samplelib\\.com", $options: "i" } },
+      { thumbnailUrl: { $regex: "images\\.unsplash\\.com", $options: "i" } },
+    ],
+  });
 }
 
 async function ensurePaymentSettings() {
@@ -1668,8 +1673,27 @@ function serializeAdminVideo(video, request) {
 }
 
 async function getPaymentSettings() {
-  if (!isDbReady()) return memory.paymentSettings;
-  return (await PaymentSettings.findOne({ key: "premium" }).lean()) || defaultPaymentSettings;
+  if (!isDbReady()) {
+    memory.paymentSettings = await persistLocalPaymentImages(memory.paymentSettings);
+    return memory.paymentSettings;
+  }
+
+  const settings = (await PaymentSettings.findOne({ key: "premium" }).lean()) || defaultPaymentSettings;
+  const nextSettings = await persistLocalPaymentImages(settings);
+  const updates = {};
+
+  if (nextSettings.qrImageUrl && nextSettings.qrImageUrl !== settings.qrImageUrl) {
+    updates.qrImageUrl = nextSettings.qrImageUrl;
+  }
+  if (nextSettings.heroImageUrl && nextSettings.heroImageUrl !== settings.heroImageUrl) {
+    updates.heroImageUrl = nextSettings.heroImageUrl;
+  }
+
+  if (Object.keys(updates).length) {
+    await PaymentSettings.updateOne({ key: "premium" }, { $set: updates }, { upsert: true });
+  }
+
+  return nextSettings;
 }
 
 async function getCatalog() {
@@ -1754,7 +1778,18 @@ function serializePremiumPlan(plan) {
 }
 
 function getPaymentQrUrl(settings, request) {
-  if (settings.qrImageUrl?.startsWith("http")) return settings.qrImageUrl;
+  if (settings.qrImageUrl?.startsWith("data:image/")) return settings.qrImageUrl;
+  if (settings.qrImageUrl?.startsWith("http")) {
+    try {
+      const url = new URL(settings.qrImageUrl);
+      if (url.pathname.startsWith("/uploads/payments/")) {
+        return `${request.protocol}://${request.get("host")}${url.pathname}`;
+      }
+    } catch {
+      return settings.qrImageUrl;
+    }
+    return settings.qrImageUrl;
+  }
   if (settings.qrImageUrl?.startsWith("/uploads/")) {
     return `${request.protocol}://${request.get("host")}${settings.qrImageUrl}`;
   }
@@ -1764,7 +1799,13 @@ function getPaymentQrUrl(settings, request) {
   return "";
 }
 
+async function fileToDataUrl(file) {
+  const buffer = await fs.promises.readFile(file.path);
+  return `data:${file.mimetype};base64,${buffer.toString("base64")}`;
+}
+
 function getHeroImageUrl(settings, request) {
+  if (settings.heroImageUrl?.startsWith("data:image/")) return settings.heroImageUrl;
   if (settings.heroImageUrl?.startsWith("http")) return settings.heroImageUrl;
   if (settings.heroImageUrl?.startsWith("/uploads/")) {
     return `${request.protocol}://${request.get("host")}${settings.heroImageUrl}`;
@@ -1773,6 +1814,62 @@ function getHeroImageUrl(settings, request) {
     return `${request.protocol}://${request.get("host")}/uploads/site/${settings.heroImagePath}`;
   }
   return "";
+}
+
+async function persistLocalPaymentImages(settings = defaultPaymentSettings) {
+  const nextSettings = { ...settings };
+  const qrDataUrl = await readStoredImageAsDataUrl(
+    nextSettings.qrImageUrl,
+    nextSettings.qrImagePath,
+    paymentUploadDir,
+    "/uploads/payments/",
+  );
+  const heroDataUrl = await readStoredImageAsDataUrl(
+    nextSettings.heroImageUrl,
+    nextSettings.heroImagePath,
+    siteUploadDir,
+    "/uploads/site/",
+  );
+
+  if (qrDataUrl) nextSettings.qrImageUrl = qrDataUrl;
+  if (heroDataUrl) nextSettings.heroImageUrl = heroDataUrl;
+  return nextSettings;
+}
+
+async function readStoredImageAsDataUrl(url, filename, uploadDir, uploadPrefix) {
+  if (url?.startsWith("data:image/")) return "";
+
+  const storedFilename = getStoredUploadFilename(url, filename, uploadPrefix);
+  if (!storedFilename) return "";
+
+  const filePath = path.join(uploadDir, path.basename(storedFilename));
+  if (!fs.existsSync(filePath)) return "";
+
+  const buffer = await fs.promises.readFile(filePath);
+  return `data:${mimeFromFilename(filePath)};base64,${buffer.toString("base64")}`;
+}
+
+function getStoredUploadFilename(url, filename, uploadPrefix) {
+  if (filename) return filename;
+  if (!url) return "";
+  if (url.startsWith(uploadPrefix)) return path.basename(url);
+
+  try {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname.startsWith(uploadPrefix)) return path.basename(parsedUrl.pathname);
+  } catch {
+    return "";
+  }
+
+  return "";
+}
+
+function mimeFromFilename(filename) {
+  const extension = path.extname(filename).toLowerCase();
+  if (extension === ".png") return "image/png";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".gif") return "image/gif";
+  return "image/jpeg";
 }
 
 function formatInr(amount = 0) {
