@@ -7,6 +7,7 @@ import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import multer from "multer";
 import morgan from "morgan";
+import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -313,6 +314,7 @@ app.get("/api/videos", optionalAuth, async (request, response, next) => {
     const isPremium = isPremiumActive(request.user);
 
     if (!isDbReady()) {
+      await ensureMemoryVideoThumbnails();
       response.json({
         videos: memory.videos
           .filter((video) => video.status === "approved")
@@ -325,8 +327,9 @@ app.get("/api/videos", optionalAuth, async (request, response, next) => {
       .sort({ createdAt: -1 })
       .limit(60)
       .lean();
+    const videosWithThumbnails = await ensureDatabaseVideoThumbnails(videos);
 
-    response.json({ videos: videos.map((video) => serializeVideo(video, isPremium, request)) });
+    response.json({ videos: videosWithThumbnails.map((video) => serializeVideo(video, isPremium, request)) });
   } catch (error) {
     next(error);
   }
@@ -343,12 +346,14 @@ app.get("/api/catalog", async (_request, response, next) => {
 app.get("/api/admin/videos", requireAdmin, async (request, response, next) => {
   try {
     if (!isDbReady()) {
+      await ensureMemoryVideoThumbnails();
       response.json({ videos: memory.videos.map((video) => serializeAdminVideo(video, request)) });
       return;
     }
 
     const videos = await Video.find().sort({ createdAt: -1 }).lean();
-    response.json({ videos: videos.map((video) => serializeAdminVideo(video, request)) });
+    const videosWithThumbnails = await ensureDatabaseVideoThumbnails(videos);
+    response.json({ videos: videosWithThumbnails.map((video) => serializeAdminVideo(video, request)) });
   } catch (error) {
     next(error);
   }
@@ -472,6 +477,7 @@ app.post("/api/admin/videos", requireAdmin, upload.fields(getUploadFields()), as
     const payload = readVideoInput(request.body);
     applyUploadedFiles(payload, request.files);
     validateVideoMedia(payload);
+    await ensureVideoThumbnail(payload);
 
     if (!isDbReady()) {
       const video = {
@@ -497,6 +503,7 @@ app.patch("/api/admin/videos/:id", requireAdmin, upload.fields(getUploadFields()
   try {
     const payload = readVideoInput(request.body, { partial: true });
     applyUploadedFiles(payload, request.files);
+    await ensureVideoThumbnail(payload);
 
     if (!isDbReady()) {
       const index = memory.videos.findIndex((video) => video.id === request.params.id);
@@ -1928,7 +1935,7 @@ function applyUploadedFiles(payload, files = {}) {
 
   if (thumbnail) {
     payload.thumbnailPath = thumbnail.filename;
-    payload.thumbnailUrl = `/uploads/thumbnails/${thumbnail.filename}`;
+    payload.thumbnailUrl = fileToDataUrlSync(thumbnail.path, thumbnail.mimetype);
   }
   if (video) payload.videoPath = video.filename;
   if (videoHd) payload.videoPathHd = videoHd.filename;
@@ -1948,7 +1955,116 @@ function validateVideoMedia(payload) {
   }
 }
 
+async function ensureMemoryVideoThumbnails() {
+  for (const video of memory.videos) {
+    await ensureVideoThumbnail(video);
+  }
+}
+
+async function ensureDatabaseVideoThumbnails(videos) {
+  const nextVideos = [];
+
+  for (const video of videos) {
+    const nextVideo = { ...video };
+    const beforeThumbnail = nextVideo.thumbnailPath || nextVideo.thumbnailUrl;
+    await ensureVideoThumbnail(nextVideo);
+
+    if ((nextVideo.thumbnailPath || nextVideo.thumbnailUrl) && (nextVideo.thumbnailPath || nextVideo.thumbnailUrl) !== beforeThumbnail) {
+      await Video.updateOne(
+        { _id: nextVideo._id },
+        {
+          $set: {
+            thumbnailPath: nextVideo.thumbnailPath || "",
+            thumbnailUrl: nextVideo.thumbnailUrl || "",
+          },
+        },
+      );
+    }
+
+    nextVideos.push(nextVideo);
+  }
+
+  return nextVideos;
+}
+
+async function ensureVideoThumbnail(video) {
+  if (hasVideoThumbnail(video)) return;
+
+  const sourcePath = getLocalThumbnailSource(video);
+  if (!sourcePath) return;
+
+  const generated = await generateVideoThumbnail(sourcePath);
+  if (!generated) return;
+
+  video.thumbnailPath = generated.filename;
+  video.thumbnailUrl = generated.dataUrl;
+}
+
+function hasVideoThumbnail(video) {
+  return Boolean(video?.thumbnailUrl || video?.thumbnailPath);
+}
+
+function getLocalThumbnailSource(video) {
+  const filename = video?.videoPath || video?.videoPathHd || video?.videoPathSd;
+  if (!filename) return "";
+
+  const filePath = getSafeUploadPath(filename, videoUploadDir);
+  return fs.existsSync(filePath) ? filePath : "";
+}
+
+function generateVideoThumbnail(videoPath) {
+  return new Promise((resolve) => {
+    const filename = `${Date.now()}-${cryptoId()}.jpg`;
+    const outputPath = path.join(thumbnailUploadDir, filename);
+    const args = [
+      "-y",
+      "-ss",
+      "00:00:02",
+      "-i",
+      videoPath,
+      "-frames:v",
+      "1",
+      "-vf",
+      "scale=720:-2",
+      "-q:v",
+      "4",
+      outputPath,
+    ];
+    const ffmpeg = spawn("ffmpeg", args, { windowsHide: true });
+    const timer = setTimeout(() => {
+      ffmpeg.kill("SIGKILL");
+      cleanupGeneratedThumbnail(outputPath);
+      resolve(null);
+    }, 20000);
+
+    ffmpeg.on("error", () => {
+      clearTimeout(timer);
+      cleanupGeneratedThumbnail(outputPath);
+      resolve(null);
+    });
+
+    ffmpeg.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && fs.existsSync(outputPath)) {
+        resolve({ filename, dataUrl: fileToDataUrlSync(outputPath, "image/jpeg") });
+        return;
+      }
+      cleanupGeneratedThumbnail(outputPath);
+      resolve(null);
+    });
+  });
+}
+
+function cleanupGeneratedThumbnail(outputPath) {
+  try {
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+  } catch {
+    // Ignore cleanup failures; missing generated thumbnails are non-fatal.
+  }
+}
+
 function getThumbnailUrl(video, request) {
+  if (video.thumbnailUrl?.startsWith("data:image/")) return video.thumbnailUrl;
   if (video.thumbnailUrl?.startsWith("http")) return video.thumbnailUrl;
   if (video.thumbnailUrl?.startsWith("/uploads/")) {
     return `${request.protocol}://${request.get("host")}${video.thumbnailUrl}`;
@@ -1956,7 +2072,15 @@ function getThumbnailUrl(video, request) {
   if (video.thumbnailPath) {
     return `${request.protocol}://${request.get("host")}/uploads/thumbnails/${video.thumbnailPath}`;
   }
+  if (video.videoPath || video.videoPathHd || video.videoPathSd || video.videoUrl || video.videoUrlHd || video.videoUrlSd) {
+    return "";
+  }
   return `${request.protocol}://${request.get("host")}/assets/default-thumbnail.svg`;
+}
+
+function fileToDataUrlSync(filePath, mimeType = "image/jpeg") {
+  const buffer = fs.readFileSync(filePath);
+  return `data:${mimeType};base64,${buffer.toString("base64")}`;
 }
 
 function getSafeUploadPath(filename, root) {
