@@ -2,6 +2,8 @@ import bcrypt from "bcryptjs";
 import cors from "cors";
 import "dotenv/config";
 import express from "express";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import ffprobeInstaller from "@ffprobe-installer/ffprobe";
 import helmet from "helmet";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
@@ -26,6 +28,16 @@ const videoUploadDir = path.join(uploadsRoot, "videos");
 const paymentUploadDir = path.join(uploadsRoot, "payments");
 const siteUploadDir = path.join(uploadsRoot, "site");
 const publicDir = path.join(process.cwd(), "public");
+const ffmpegPath = process.env.FFMPEG_PATH || ffmpegInstaller.path || "ffmpeg";
+const ffprobePath = process.env.FFPROBE_PATH || ffprobeInstaller.path || "ffprobe";
+const supportedVideoExtensions = new Set([".mp4", ".mov", ".m4v", ".webm"]);
+const supportedVideoMimeTypes = new Set([
+  "video/mp4",
+  "video/quicktime",
+  "video/x-m4v",
+  "video/webm",
+  "application/octet-stream",
+]);
 
 fs.mkdirSync(thumbnailUploadDir, { recursive: true });
 fs.mkdirSync(videoUploadDir, { recursive: true });
@@ -34,9 +46,9 @@ fs.mkdirSync(siteUploadDir, { recursive: true });
 fs.mkdirSync(publicDir, { recursive: true });
 
 const defaultPremiumPlans = [
-  { id: "days7", name: "7 Days", durationDays: 7, amount: 3900 },
-  { id: "days15", name: "15 Days", durationDays: 15, amount: 6900 },
-  { id: "month1", name: "1 Month", durationDays: 30, amount: 11900 },
+  { id: "days7", name: "7 Days", durationDays: 7, amount: 3900, originalAmount: 5900 },
+  { id: "days15", name: "15 Days", durationDays: 15, amount: 6900, originalAmount: 9900 },
+  { id: "month1", name: "1 Month", durationDays: 30, amount: 11900, originalAmount: 19900 },
 ];
 
 const defaultPaymentSettings = {
@@ -90,14 +102,15 @@ const upload = multer({
       callback(null, true);
       return;
     }
-    if (["video", "videoHd", "videoSd"].includes(file.fieldname) && file.mimetype.startsWith("video/")) {
+    if (["video", "videoHd", "videoSd"].includes(file.fieldname) && isSupportedVideoUpload(file)) {
       callback(null, true);
       return;
     }
-    callback(httpError(400, "Invalid upload file type."));
+    callback(httpError(400, "Unsupported file type. Videos must be MP4, MOV, M4V, or WEBM."));
   },
 });
 
+app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(
   cors({
@@ -146,14 +159,14 @@ app.use(
   "/assets",
   express.static(publicDir, {
     immutable: true,
-    maxAge: "7d",
+    maxAge: "30d",
   }),
 );
 app.use(
   "/uploads/thumbnails",
   express.static(thumbnailUploadDir, {
     immutable: true,
-    maxAge: "7d",
+    maxAge: "30d",
   }),
 );
 app.use(
@@ -176,7 +189,7 @@ const userSchema = new mongoose.Schema(
     name: { type: String, trim: true, default: "Member" },
     email: { type: String, unique: true, required: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
-    role: { type: String, enum: ["user", "admin"], default: "user" },
+    role: { type: String, enum: ["user", "admin", "partner"], default: "user" },
     isBlocked: { type: Boolean, default: false },
     isPremium: { type: Boolean, default: false },
     plan: { type: String, default: "" },
@@ -200,13 +213,32 @@ const videoSchema = new mongoose.Schema(
     videoPath: { type: String, default: "" },
     videoPathHd: { type: String, default: "" },
     videoPathSd: { type: String, default: "" },
+    videoFileId: { type: String, default: "" },
+    videoFileIdHd: { type: String, default: "" },
+    videoFileIdSd: { type: String, default: "" },
     duration: { type: String, default: "00:00" },
     views: { type: Number, default: 0 },
     premiumOnly: { type: Boolean, default: true },
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "approved" },
+    uploadStatus: { type: String, enum: ["uploaded", "failed", ""], default: "" },
+    processingStatus: { type: String, enum: ["pending", "processing", "ready", "failed", ""], default: "" },
+    processingError: { type: String, default: "" },
+    processedAt: { type: Date },
+    playbackHealthStatus: { type: String, enum: ["unchecked", "passed", "failed", ""], default: "unchecked" },
+    playbackCheckedAt: { type: Date },
+    playbackError: { type: String, default: "" },
+    uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    uploadedByName: { type: String, trim: true, default: "" },
+    uploadedByRole: { type: String, enum: ["admin", "partner", ""], default: "" },
   },
   { timestamps: true },
 );
+
+videoSchema.index({ status: 1, createdAt: -1 });
+videoSchema.index({ status: 1, section: 1, createdAt: -1 });
+videoSchema.index({ status: 1, category: 1, createdAt: -1 });
+videoSchema.index({ uploadedBy: 1, createdAt: -1 });
+videoSchema.index({ title: "text", creator: "text", category: "text", section: "text" });
 
 const paymentSchema = new mongoose.Schema(
   {
@@ -242,6 +274,7 @@ const paymentSettingsSchema = new mongoose.Schema(
         name: { type: String, required: true },
         durationDays: { type: Number, required: true },
         amount: { type: Number, required: true },
+        originalAmount: { type: Number, default: 0 },
       },
     ],
   },
@@ -312,24 +345,59 @@ app.get("/api/health", (_request, response) => {
 app.get("/api/videos", optionalAuth, async (request, response, next) => {
   try {
     const isPremium = isPremiumActive(request.user);
+    const page = clampInteger(request.query.page, 1, 10000, 1);
+    const limit = clampInteger(request.query.limit, 1, 500, 24);
+    const skip = (page - 1) * limit;
 
     if (!isDbReady()) {
       await ensureMemoryVideoThumbnails();
+      const approvedVideos = memory.videos.filter(isPublicVideoReady);
+      const pageVideos = approvedVideos.slice(skip, skip + limit);
       response.json({
-        videos: memory.videos
-          .filter((video) => video.status === "approved")
-          .map((video) => serializeVideo(video, isPremium, request)),
+        videos: pageVideos.map((video) => serializeVideo(video, isPremium, request)),
+        page,
+        limit,
+        total: approvedVideos.length,
+        hasMore: skip + pageVideos.length < approvedVideos.length,
       });
       return;
     }
 
-    const videos = await Video.find({ status: "approved" })
+    const videos = await Video.find({
+      status: "approved",
+      $and: [
+        {
+          $or: [
+            { processingStatus: { $in: ["ready", ""] } },
+            { processingStatus: { $exists: false } },
+          ],
+        },
+        {
+          $or: [
+            { playbackHealthStatus: { $in: ["passed", "unchecked", ""] } },
+            { playbackHealthStatus: { $exists: false } },
+          ],
+        },
+      ],
+    })
       .sort({ createdAt: -1 })
-      .limit(60)
+      .skip(skip)
+      .limit(limit + 1)
+      .select(
+        "title creator category section thumbnailUrl thumbnailPath videoUrl videoUrlHd videoUrlSd videoPath videoPathHd videoPathSd videoFileId videoFileIdHd videoFileIdSd duration views premiumOnly status createdAt",
+      )
       .lean();
-    const videosWithThumbnails = await ensureDatabaseVideoThumbnails(videos);
+    const hasMore = videos.length > limit;
+    const pageVideos = hasMore ? videos.slice(0, limit) : videos;
+    const videosWithThumbnails = await ensureDatabaseVideoThumbnails(pageVideos);
 
-    response.json({ videos: videosWithThumbnails.map((video) => serializeVideo(video, isPremium, request)) });
+    response.setHeader("Cache-Control", request.user ? "private, max-age=20" : "public, max-age=45, stale-while-revalidate=120");
+    response.json({
+      videos: videosWithThumbnails.map((video) => serializeVideo(video, isPremium, request)),
+      page,
+      limit,
+      hasMore,
+    });
   } catch (error) {
     next(error);
   }
@@ -337,23 +405,53 @@ app.get("/api/videos", optionalAuth, async (request, response, next) => {
 
 app.get("/api/catalog", async (_request, response, next) => {
   try {
+    response.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     response.json({ catalog: await getCatalog() });
   } catch (error) {
     next(error);
   }
 });
 
-app.get("/api/admin/videos", requireAdmin, async (request, response, next) => {
+app.get("/api/admin/videos", requireContentManager, async (request, response, next) => {
   try {
     if (!isDbReady()) {
       await ensureMemoryVideoThumbnails();
-      response.json({ videos: memory.videos.map((video) => serializeAdminVideo(video, request)) });
+      const visibleVideos = request.user.role === "admin"
+        ? memory.videos
+        : memory.videos.filter((video) => String(video.uploadedBy || "") === String(request.user.id));
+      response.json({ videos: visibleVideos.map((video) => serializeAdminVideo(video, request)) });
       return;
     }
 
-    const videos = await Video.find().sort({ createdAt: -1 }).lean();
+    const query = request.user.role === "admin" ? {} : { uploadedBy: request.user._id };
+    const videos = await Video.find(query).sort({ createdAt: -1 }).lean();
     const videosWithThumbnails = await ensureDatabaseVideoThumbnails(videos);
     response.json({ videos: videosWithThumbnails.map((video) => serializeAdminVideo(video, request)) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/videos/broken", requireContentManager, async (request, response, next) => {
+  try {
+    if (!isDbReady()) {
+      const visibleVideos = request.user.role === "admin"
+        ? memory.videos
+        : memory.videos.filter((video) => String(video.uploadedBy || "") === String(request.user.id));
+      response.json({
+        videos: visibleVideos.filter(isBrokenVideo).map((video) => serializeAdminVideo(video, request)),
+      });
+      return;
+    }
+
+    const ownerQuery = request.user.role === "admin" ? {} : { uploadedBy: request.user._id };
+    const videos = await Video.find(ownerQuery)
+      .sort({ updatedAt: -1 })
+      .limit(500)
+      .lean();
+
+    const brokenVideos = videos.filter(isBrokenVideo);
+    response.json({ videos: brokenVideos.map((video) => serializeAdminVideo(video, request)) });
   } catch (error) {
     next(error);
   }
@@ -404,6 +502,9 @@ app.post("/api/videos/:id/playback-token", requirePremium, async (request, respo
     if (!video || video.status !== "approved") {
       throw httpError(404, "Video not found.");
     }
+    if (!hasPlayableVideoSource(video)) {
+      throw httpError(404, "Video source missing. Please re-upload this video.");
+    }
 
     const token = jwt.sign(
       {
@@ -412,13 +513,13 @@ app.post("/api/videos/:id/playback-token", requirePremium, async (request, respo
         videoId: String(video._id || video.id),
       },
       jwtSecret,
-      { expiresIn: "2m" },
+      { expiresIn: "6h" },
     );
 
-    const baseUrl = `${request.protocol}://${request.get("host")}`;
+    const baseUrl = getPublicBaseUrl(request);
     response.json({
       streamUrl: `${baseUrl}/api/videos/${video._id || video.id}/stream?token=${encodeURIComponent(token)}`,
-      expiresInSeconds: 120,
+      expiresInSeconds: 21600,
       qualities: getAvailableQualities(video),
     });
   } catch (error) {
@@ -443,6 +544,11 @@ app.get("/api/videos/:id/stream", async (request, response, next) => {
 
     if (source.type === "local") {
       streamLocalVideo(source.path, request, response);
+      return;
+    }
+
+    if (source.type === "gridfs") {
+      await streamGridFsVideo(source.fileId, request, response);
       return;
     }
 
@@ -472,12 +578,51 @@ app.get("/api/videos/:id/stream", async (request, response, next) => {
   }
 });
 
-app.post("/api/admin/videos", requireAdmin, upload.fields(getUploadFields()), async (request, response, next) => {
+app.post("/api/playback-errors", optionalAuth, async (request, response, next) => {
   try {
-    const payload = readVideoInput(request.body);
+    const videoId = String(request.body?.videoId || "").trim();
+    const message = String(request.body?.message || "Playback failed.").slice(0, 500);
+    const userAgent = String(request.headers["user-agent"] || "").slice(0, 300);
+
+    console.warn("Playback failure:", {
+      videoId,
+      message,
+      userId: request.user?._id || request.user?.id || "",
+      userAgent,
+      at: new Date().toISOString(),
+    });
+
+    if (isDbReady() && mongoose.isValidObjectId(videoId)) {
+      await Video.updateOne(
+        { _id: videoId },
+        {
+          $set: {
+            playbackError: message,
+          },
+        },
+      );
+    }
+
+    response.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/videos", requireContentManager, upload.fields(getUploadFields()), async (request, response, next) => {
+  let payload;
+  try {
+    payload = readVideoInput(request.body);
+    markVideoProcessing(payload);
+    const mediaMetadata = await processUploadedVideoFiles(request.files);
     applyUploadedFiles(payload, request.files);
+    applyVideoMetadata(payload, mediaMetadata);
+    await persistUploadedVideoFiles(payload, request.files);
     validateVideoMedia(payload);
+    await validateStoredVideo(payload);
     await ensureVideoThumbnail(payload);
+    applyUploadOwner(payload, request.user);
+    markVideoReady(payload);
 
     if (!isDbReady()) {
       const video = {
@@ -495,39 +640,58 @@ app.post("/api/admin/videos", requireAdmin, upload.fields(getUploadFields()), as
   const video = await Video.create(payload);
   response.status(201).json({ video: serializeAdminVideo(video.toObject(), request) });
   } catch (error) {
+    await recordProcessingFailure(payload, request.user, error);
     next(error);
   }
 });
 
-app.patch("/api/admin/videos/:id", requireAdmin, upload.fields(getUploadFields()), async (request, response, next) => {
+app.patch("/api/admin/videos/:id", requireContentManager, upload.fields(getUploadFields()), async (request, response, next) => {
+  let payload;
   try {
-    const payload = readVideoInput(request.body, { partial: true });
+    payload = readVideoInput(request.body, { partial: true });
+    const hasNewMedia = hasUploadedVideoFiles(request.files);
+    if (hasNewMedia) markVideoProcessing(payload);
+    const mediaMetadata = await processUploadedVideoFiles(request.files);
     applyUploadedFiles(payload, request.files);
+    applyVideoMetadata(payload, mediaMetadata);
+    await persistUploadedVideoFiles(payload, request.files);
+    if (hasNewMedia) {
+      validateVideoMedia(payload);
+      await validateStoredVideo(payload);
+    }
     await ensureVideoThumbnail(payload);
+    if (hasNewMedia) markVideoReady(payload);
 
     if (!isDbReady()) {
       const index = memory.videos.findIndex((video) => video.id === request.params.id);
       if (index === -1) throw httpError(404, "Video not found.");
+      if (!canManageVideo(request.user, memory.videos[index])) throw httpError(403, "You can only manage your own videos.");
       memory.videos[index] = { ...memory.videos[index], ...payload };
       response.json({ video: serializeAdminVideo(memory.videos[index], request) });
       return;
     }
 
-    const video = await Video.findByIdAndUpdate(request.params.id, payload, {
+    const query = request.user.role === "admin"
+      ? { _id: request.params.id }
+      : { _id: request.params.id, uploadedBy: request.user._id };
+    const video = await Video.findOneAndUpdate(query, payload, {
       new: true,
       runValidators: true,
     });
     if (!video) throw httpError(404, "Video not found.");
     response.json({ video: serializeAdminVideo(video.toObject(), request) });
   } catch (error) {
+    await recordProcessingFailure(payload, request.user, error, request.params.id);
     next(error);
   }
 });
 
-app.delete("/api/admin/videos/:id", requireAdmin, async (request, response, next) => {
+app.delete("/api/admin/videos/:id", requireContentManager, async (request, response, next) => {
   try {
     if (!isDbReady()) {
       const removedVideo = memory.videos.find((video) => video.id === request.params.id);
+      if (!removedVideo) throw httpError(404, "Video not found.");
+      if (!canManageVideo(request.user, removedVideo)) throw httpError(403, "You can only manage your own videos.");
       const before = memory.videos.length;
       memory.videos = memory.videos.filter((video) => video.id !== request.params.id);
       if (memory.videos.length === before) throw httpError(404, "Video not found.");
@@ -536,7 +700,10 @@ app.delete("/api/admin/videos/:id", requireAdmin, async (request, response, next
       return;
     }
 
-    const video = await Video.findByIdAndDelete(request.params.id);
+    const query = request.user.role === "admin"
+      ? { _id: request.params.id }
+      : { _id: request.params.id, uploadedBy: request.user._id };
+    const video = await Video.findOneAndDelete(query);
     if (!video) throw httpError(404, "Video not found.");
     deleteUploadedFiles(video);
     response.json({ ok: true });
@@ -658,6 +825,7 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
 app.get("/api/payment-settings", async (request, response, next) => {
   try {
     const settings = await getPaymentSettings();
+    response.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     response.json({ settings: serializePaymentSettings(settings, request) });
   } catch (error) {
     next(error);
@@ -720,7 +888,7 @@ app.post("/api/auth/register", async (request, response, next) => {
         name,
         email,
         passwordHash,
-        role: isAdminEmail(email) ? "admin" : "user",
+        role: getDefaultRoleForEmail(email),
         isBlocked: false,
         isPremium: false,
         plan: "",
@@ -734,7 +902,7 @@ app.post("/api/auth/register", async (request, response, next) => {
       name,
       email,
       passwordHash,
-      role: isAdminEmail(email) ? "admin" : "user",
+      role: getDefaultRoleForEmail(email),
     });
     response.status(201).json(createSession(user));
   } catch (error) {
@@ -872,7 +1040,17 @@ app.get("/api/dashboard", requireAuth, (request, response) => {
 });
 
 app.use((error, _request, response, _next) => {
+  if (error instanceof multer.MulterError) {
+    const message = error.code === "LIMIT_FILE_SIZE"
+      ? "Video is too large. Maximum upload size is 3 GB."
+      : error.message || "Upload failed.";
+    console.warn("Upload failure:", { message, code: error.code, at: new Date().toISOString() });
+    response.status(400).json({ message });
+    return;
+  }
+
   if (error.statusCode) {
+    console.warn("Request failure:", { message: error.message, statusCode: error.statusCode, at: new Date().toISOString() });
     response.status(error.statusCode).json({ message: error.message });
     return;
   }
@@ -883,6 +1061,7 @@ app.use((error, _request, response, _next) => {
 
 async function start() {
   await ensureMemoryAdmin();
+  await ensureMemoryPartner();
   memory.videos = [];
 
   const uri = process.env.MONGODB_URI;
@@ -890,9 +1069,15 @@ async function start() {
     try {
       await mongoose.connect(uri);
       await ensureDatabaseAdmin();
+      await ensureDatabasePartner();
       await ensureDatabaseVideos();
       await ensurePaymentSettings();
       await ensureCatalogItems();
+      try {
+        await backfillLocalVideosToGridFs();
+      } catch (error) {
+        console.warn("Could not backfill local videos to GridFS:", error.message);
+      }
       console.log("MongoDB connected");
     } catch (error) {
       console.error(`MongoDB connection failed: ${error.message}`);
@@ -927,6 +1112,9 @@ function readVideoInput(body, options = { partial: false }) {
       "videoPath",
       "videoPathHd",
       "videoPathSd",
+      "videoFileId",
+      "videoFileIdHd",
+      "videoFileIdSd",
       "duration",
       "status",
     ];
@@ -945,6 +1133,10 @@ function readVideoInput(body, options = { partial: false }) {
     if (payload.status && !["pending", "approved", "rejected"].includes(payload.status)) {
       throw httpError(400, "Valid status is required.");
     }
+    if (payload.category && body?.section === undefined) {
+      payload.section = payload.category;
+    }
+    validateStableMediaUrls(payload);
     return payload;
   }
 
@@ -952,7 +1144,7 @@ function readVideoInput(body, options = { partial: false }) {
     title: String(body?.title || "").trim(),
     creator: String(body?.creator || "TeamUSA").trim(),
     category: String(body?.category || "").trim(),
-    section: String(body?.section || defaultCatalog.sections[0]).trim(),
+    section: String(body?.section || body?.category || defaultCatalog.sections[0]).trim(),
     thumbnailUrl: String(body?.thumbnailUrl || "").trim(),
     thumbnailPath: String(body?.thumbnailPath || "").trim(),
     videoUrl: String(body?.videoUrl || "").trim(),
@@ -961,6 +1153,9 @@ function readVideoInput(body, options = { partial: false }) {
     videoPath: String(body?.videoPath || "").trim(),
     videoPathHd: String(body?.videoPathHd || "").trim(),
     videoPathSd: String(body?.videoPathSd || "").trim(),
+    videoFileId: String(body?.videoFileId || "").trim(),
+    videoFileIdHd: String(body?.videoFileIdHd || "").trim(),
+    videoFileIdSd: String(body?.videoFileIdSd || "").trim(),
     duration: String(body?.duration || "00:00").trim(),
     views: normalizeViews(body?.views),
     status: String(body?.status || "approved").trim(),
@@ -973,6 +1168,7 @@ function readVideoInput(body, options = { partial: false }) {
   if (!["pending", "approved", "rejected"].includes(fields.status)) {
     throw httpError(400, "Valid status is required.");
   }
+  validateStableMediaUrls(fields);
 
   return fields;
 }
@@ -982,6 +1178,92 @@ function normalizeViews(value) {
   const views = Number(value);
   if (!Number.isFinite(views) || views < 0) throw httpError(400, "Valid views count is required.");
   return Math.round(views);
+}
+
+function validateStableMediaUrls(payload = {}) {
+  const fields = ["videoUrl", "videoUrlHd", "videoUrlSd", "thumbnailUrl"];
+  for (const field of fields) {
+    const value = payload[field];
+    if (!value) continue;
+    if (field === "thumbnailUrl" && value.startsWith("data:image/")) continue;
+    if (value.startsWith("/uploads/") || value.startsWith("/api/")) continue;
+
+    let url;
+    try {
+      url = new URL(value);
+    } catch {
+      throw httpError(400, `${field} must be a valid HTTPS URL.`);
+    }
+
+    const hostname = url.hostname.toLowerCase();
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".test") ||
+      hostname.includes("ngrok-free.app");
+    if (url.protocol !== "https:" || isLocal) {
+      throw httpError(400, `${field} must be a permanent HTTPS URL, not a local or temporary URL.`);
+    }
+  }
+}
+
+function markVideoProcessing(payload) {
+  payload.status = "pending";
+  payload.uploadStatus = "uploaded";
+  payload.processingStatus = "processing";
+  payload.processingError = "";
+  payload.playbackHealthStatus = "unchecked";
+  payload.playbackError = "";
+}
+
+function markVideoReady(payload) {
+  payload.status = "approved";
+  payload.uploadStatus = "uploaded";
+  payload.processingStatus = "ready";
+  payload.processingError = "";
+  payload.playbackHealthStatus = "passed";
+  payload.playbackError = "";
+  payload.processedAt = new Date();
+  payload.playbackCheckedAt = new Date();
+}
+
+function hasUploadedVideoFiles(files = {}) {
+  return Boolean(files.video?.[0] || files.videoHd?.[0] || files.videoSd?.[0]);
+}
+
+function isPublicVideoReady(video) {
+  return (
+    video.status === "approved" &&
+    (!video.processingStatus || video.processingStatus === "ready") &&
+    (!video.playbackHealthStatus || ["passed", "unchecked"].includes(video.playbackHealthStatus)) &&
+    hasPlayableVideoSource(video)
+  );
+}
+
+function isBrokenVideo(video) {
+  return (
+    !hasPlayableVideoSource(video) ||
+    video.processingStatus === "failed" ||
+    video.processingStatus === "pending" ||
+    video.processingStatus === "processing" ||
+    video.playbackHealthStatus === "failed" ||
+    video.status !== "approved"
+  );
+}
+
+function applyUploadOwner(payload, user) {
+  if (!user) return payload;
+  payload.uploadedBy = user._id || user.id;
+  payload.uploadedByName = user.name || (user.role === "partner" ? "Partner" : "Admin");
+  payload.uploadedByRole = user.role === "partner" ? "partner" : "admin";
+  return payload;
+}
+
+function canManageVideo(user, video) {
+  if (!user || !video) return false;
+  if (user.role === "admin") return true;
+  return user.role === "partner" && String(video.uploadedBy || "") === String(user._id || user.id);
 }
 
 function readAuthInput(body, options = { requireName: true }) {
@@ -1203,6 +1485,12 @@ function toPaise(value) {
   return Math.round(number * 100);
 }
 
+function clampInteger(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isInteger(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
 function readPremiumPlansInput(value) {
   if (value === undefined || value === null || value === "") return null;
 
@@ -1219,6 +1507,7 @@ function readPremiumPlansInput(value) {
     const item = parsed.find((plan) => plan?.id === defaultPlan.id) || {};
     const durationDays = Number(item.durationDays);
     const amount = toPaise(item.amount);
+    const originalAmount = toPaise(item.originalAmount);
 
     if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 365) {
       throw httpError(400, "Plan days must be between 1 and 365.");
@@ -1227,11 +1516,14 @@ function readPremiumPlansInput(value) {
       throw httpError(400, "Plan amount must be at least INR 1.");
     }
 
+    const safeOriginalAmount = originalAmount && originalAmount > amount ? originalAmount : amount;
+
     return {
       id: defaultPlan.id,
       name: formatPlanName(defaultPlan.id, durationDays),
       durationDays,
       amount,
+      originalAmount: safeOriginalAmount,
     };
   });
 }
@@ -1337,12 +1629,14 @@ function getConfiguredPlans(settings = defaultPaymentSettings) {
     const item = source.find((plan) => plan?.id === defaultPlan.id) || defaultPlan;
     const durationDays = Number(item.durationDays) || defaultPlan.durationDays;
     const amount = Number(item.amount) || defaultPlan.amount;
+    const originalAmount = Number(item.originalAmount) || defaultPlan.originalAmount || amount;
 
     return {
       id: defaultPlan.id,
       name: formatPlanName(defaultPlan.id, durationDays),
       durationDays,
       amount,
+      originalAmount: originalAmount > amount ? originalAmount : amount,
     };
   });
 }
@@ -1412,6 +1706,28 @@ async function requireAdmin(request, response, next) {
     }
     if (user.role !== "admin") {
       response.status(403).json({ message: "Admin access required." });
+      return;
+    }
+    request.user = user;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function requireContentManager(request, response, next) {
+  try {
+    const user = await readUserFromToken(request);
+    if (!user) {
+      response.status(401).json({ message: "Authentication required." });
+      return;
+    }
+    if (user.isBlocked) {
+      response.status(403).json({ message: "Your account is blocked." });
+      return;
+    }
+    if (!["admin", "partner"].includes(user.role)) {
+      response.status(403).json({ message: "Content manager access required." });
       return;
     }
     request.user = user;
@@ -1596,6 +1912,54 @@ async function ensureDatabaseAdmin() {
   });
 }
 
+async function ensureMemoryPartner() {
+  const email = getPartnerEmail();
+  const existing = memory.users.find((user) => user.email === email);
+  if (existing) {
+    existing.name = "Partner";
+    existing.passwordHash = await bcrypt.hash(getPartnerPassword(), 10);
+    existing.role = "partner";
+    existing.isPremium = false;
+    existing.plan = "";
+    return;
+  }
+
+  memory.users.push({
+    id: "partner-dev",
+    name: "Partner",
+    email,
+    passwordHash: await bcrypt.hash(getPartnerPassword(), 10),
+    role: "partner",
+    isBlocked: false,
+    isPremium: false,
+    plan: "",
+  });
+}
+
+async function ensureDatabasePartner() {
+  const email = getPartnerEmail();
+  const existing = await User.findOne({ email });
+  if (existing) {
+    existing.name = "Partner";
+    existing.passwordHash = await bcrypt.hash(getPartnerPassword(), 10);
+    existing.role = "partner";
+    existing.isPremium = false;
+    existing.plan = "";
+    await existing.save();
+    return;
+  }
+
+  await User.create({
+    name: "Partner",
+    email,
+    passwordHash: await bcrypt.hash(getPartnerPassword(), 10),
+    role: "partner",
+    isBlocked: false,
+    isPremium: false,
+    plan: "",
+  });
+}
+
 async function ensureDatabaseVideos() {
   await Video.deleteMany({
     title: { $in: demoVideos.map((video) => video.title) },
@@ -1637,12 +2001,30 @@ function isAdminEmail(email) {
   return email === getAdminEmail();
 }
 
+function isPartnerEmail(email) {
+  return email === getPartnerEmail();
+}
+
+function getDefaultRoleForEmail(email) {
+  if (isAdminEmail(email)) return "admin";
+  if (isPartnerEmail(email)) return "partner";
+  return "user";
+}
+
 function getAdminEmail() {
   return (process.env.ADMIN_EMAIL || "admin@luxevault.local").trim().toLowerCase();
 }
 
 function getAdminPassword() {
   return process.env.ADMIN_PASSWORD || "admin123";
+}
+
+function getPartnerEmail() {
+  return (process.env.PARTNER_EMAIL || "partner@teamusa22.in").trim().toLowerCase();
+}
+
+function getPartnerPassword() {
+  return process.env.PARTNER_PASSWORD || "partner@123";
 }
 
 function serializeVideo(video, isPremium, request) {
@@ -1658,15 +2040,8 @@ function serializeVideo(video, isPremium, request) {
     premiumOnly: video.premiumOnly,
     status: video.status,
     locked: Boolean(video.premiumOnly && !isPremium),
-    hasPlayback: Boolean(
-      isPremium &&
-        (video.videoPath ||
-          video.videoPathHd ||
-          video.videoPathSd ||
-          video.videoUrl ||
-          video.videoUrlHd ||
-          video.videoUrlSd),
-    ),
+    hasPlayback: Boolean(isPremium && hasPlayableVideoSource(video)),
+    sourceMissing: !hasPlayableVideoSource(video),
   };
 }
 
@@ -1674,8 +2049,15 @@ function serializeAdminVideo(video, request) {
   return {
     ...video,
     id: String(video._id || video.id),
+    uploadedBy: video.uploadedBy ? String(video.uploadedBy) : "",
+    uploadedByName: video.uploadedByName || "",
+    uploadedByRole: video.uploadedByRole || "",
     thumbnailUrl: getThumbnailUrl(video, request),
-    sourceType: video.videoPath || video.videoPathHd || video.videoPathSd ? "Uploaded file" : "External URL",
+    sourceType:
+      video.videoPath || video.videoPathHd || video.videoPathSd || video.videoFileId || video.videoFileIdHd || video.videoFileIdSd
+        ? "Uploaded file"
+        : "External URL",
+    sourceMissing: !hasPlayableVideoSource(video),
   };
 }
 
@@ -1780,7 +2162,10 @@ function serializePremiumPlan(plan) {
     name: plan.name,
     durationDays: plan.durationDays,
     amount: plan.amount,
+    originalAmount: plan.originalAmount,
     priceText: formatInr(plan.amount),
+    originalPriceText: plan.originalAmount > plan.amount ? formatInr(plan.originalAmount) : "",
+    offerLabel: calculateOfferLabel(plan.amount, plan.originalAmount),
   };
 }
 
@@ -1790,18 +2175,18 @@ function getPaymentQrUrl(settings, request) {
     try {
       const url = new URL(settings.qrImageUrl);
       if (url.pathname.startsWith("/uploads/payments/")) {
-        return `${request.protocol}://${request.get("host")}${url.pathname}`;
+        return `${getPublicBaseUrl(request)}${url.pathname}`;
       }
     } catch {
-      return settings.qrImageUrl;
+      return normalizeHttpsUrl(settings.qrImageUrl);
     }
-    return settings.qrImageUrl;
+    return normalizeHttpsUrl(settings.qrImageUrl);
   }
   if (settings.qrImageUrl?.startsWith("/uploads/")) {
-    return `${request.protocol}://${request.get("host")}${settings.qrImageUrl}`;
+    return `${getPublicBaseUrl(request)}${settings.qrImageUrl}`;
   }
   if (settings.qrImagePath) {
-    return `${request.protocol}://${request.get("host")}/uploads/payments/${settings.qrImagePath}`;
+    return `${getPublicBaseUrl(request)}/uploads/payments/${settings.qrImagePath}`;
   }
   return "";
 }
@@ -1813,12 +2198,12 @@ async function fileToDataUrl(file) {
 
 function getHeroImageUrl(settings, request) {
   if (settings.heroImageUrl?.startsWith("data:image/")) return settings.heroImageUrl;
-  if (settings.heroImageUrl?.startsWith("http")) return settings.heroImageUrl;
+  if (settings.heroImageUrl?.startsWith("http")) return normalizeHttpsUrl(settings.heroImageUrl);
   if (settings.heroImageUrl?.startsWith("/uploads/")) {
-    return `${request.protocol}://${request.get("host")}${settings.heroImageUrl}`;
+    return `${getPublicBaseUrl(request)}${settings.heroImageUrl}`;
   }
   if (settings.heroImagePath) {
-    return `${request.protocol}://${request.get("host")}/uploads/site/${settings.heroImagePath}`;
+    return `${getPublicBaseUrl(request)}/uploads/site/${settings.heroImagePath}`;
   }
   return "";
 }
@@ -1887,25 +2272,70 @@ function formatInr(amount = 0) {
 
 function getAvailableQualities(video) {
   const qualities = [{ id: "auto", label: "Auto" }];
-  if (video.videoPathHd || video.videoUrlHd || video.videoPath || video.videoUrl) {
+  if (hasVideoSourceForQuality(video, "hd")) {
     qualities.push({ id: "hd", label: "HD" });
   }
-  if (video.videoPathSd || video.videoUrlSd || video.videoPath || video.videoUrl) {
+  if (hasVideoSourceForQuality(video, "sd")) {
     qualities.push({ id: "sd", label: "SD" });
   }
   return qualities;
 }
 
+function hasPlayableVideoSource(video) {
+  return hasVideoSourceForQuality(video, "auto") || hasVideoSourceForQuality(video, "hd") || hasVideoSourceForQuality(video, "sd");
+}
+
+function hasVideoSourceForQuality(video, quality) {
+  const localFilename =
+    quality === "sd"
+      ? video.videoPathSd || video.videoPath
+      : quality === "hd"
+        ? video.videoPathHd || video.videoPath
+        : video.videoPathHd || video.videoPath || video.videoPathSd;
+  const gridFileId =
+    quality === "sd"
+      ? video.videoFileIdSd || video.videoFileId
+      : quality === "hd"
+        ? video.videoFileIdHd || video.videoFileId
+        : video.videoFileIdHd || video.videoFileId || video.videoFileIdSd;
+  const remoteUrl =
+    quality === "sd"
+      ? video.videoUrlSd || video.videoUrl
+      : quality === "hd"
+        ? video.videoUrlHd || video.videoUrl
+        : video.videoUrlHd || video.videoUrl || video.videoUrlSd;
+
+  return Boolean(
+    (localFilename && fs.existsSync(getSafeUploadPath(localFilename, videoUploadDir))) ||
+      gridFileId ||
+      isStableHttpsMediaUrl(remoteUrl),
+  );
+}
+
 function selectVideoSource(video, quality) {
-  const localPath =
+  const localFilename =
     quality === "sd"
       ? video.videoPathSd || video.videoPath
       : quality === "hd"
         ? video.videoPathHd || video.videoPath
         : video.videoPathHd || video.videoPath || video.videoPathSd;
 
-  if (localPath) {
-    return { type: "local", path: getSafeUploadPath(localPath, videoUploadDir) };
+  if (localFilename) {
+    const localPath = getSafeUploadPath(localFilename, videoUploadDir);
+    if (fs.existsSync(localPath)) {
+      return { type: "local", path: localPath };
+    }
+  }
+
+  const gridFileId =
+    quality === "sd"
+      ? video.videoFileIdSd || video.videoFileId
+      : quality === "hd"
+        ? video.videoFileIdHd || video.videoFileId
+        : video.videoFileIdHd || video.videoFileId || video.videoFileIdSd;
+
+  if (gridFileId) {
+    return { type: "gridfs", fileId: gridFileId };
   }
 
   const url =
@@ -1915,7 +2345,24 @@ function selectVideoSource(video, quality) {
         ? video.videoUrlHd || video.videoUrl
         : video.videoUrlHd || video.videoUrl || video.videoUrlSd;
 
-  return url ? { type: "remote", url } : null;
+  return isStableHttpsMediaUrl(url) ? { type: "remote", url: normalizeHttpsUrl(url) } : null;
+}
+
+function isStableHttpsMediaUrl(value = "") {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".test") ||
+      hostname.includes("ngrok-free.app");
+    return url.protocol === "https:" && !isLocal;
+  } catch {
+    return false;
+  }
 }
 
 function getUploadFields() {
@@ -1925,6 +2372,254 @@ function getUploadFields() {
     { name: "videoHd", maxCount: 1 },
     { name: "videoSd", maxCount: 1 },
   ];
+}
+
+async function processUploadedVideoFiles(files = {}) {
+  const metadata = {};
+  const mappings = [
+    ["video", "duration"],
+    ["videoHd", "durationHd"],
+    ["videoSd", "durationSd"],
+  ];
+
+  for (const [fieldName, metadataKey] of mappings) {
+    const file = files[fieldName]?.[0];
+    if (!file) continue;
+    validateVideoUpload(file);
+    metadata[metadataKey] = await processVideoUpload(file);
+  }
+
+  return metadata;
+}
+
+async function processVideoUpload(file) {
+  const originalPath = file.path;
+  const outputFilename = `${path.basename(file.filename, path.extname(file.filename))}-processed.mp4`;
+  const outputPath = path.join(videoUploadDir, outputFilename);
+
+  await convertVideoToMp4(originalPath, outputPath);
+
+  const stats = await fs.promises.stat(outputPath);
+  if (!stats.size) {
+    throw httpError(400, "Video conversion failed. Please upload a valid MP4, MOV, M4V, or WEBM file.");
+  }
+
+  if (outputPath !== originalPath && fs.existsSync(originalPath)) {
+    await fs.promises.unlink(originalPath).catch(() => {});
+  }
+
+  file.filename = outputFilename;
+  file.path = outputPath;
+  file.destination = videoUploadDir;
+  file.mimetype = "video/mp4";
+  file.size = stats.size;
+
+  const metadata = await readVideoMetadata(outputPath);
+  if (!metadata.hasVideo || metadata.videoCodec !== "h264") {
+    throw httpError(400, "Processed video failed compatibility checks.");
+  }
+
+  return metadata;
+}
+
+function validateVideoUpload(file) {
+  if (!isSupportedVideoUpload(file)) {
+    throw httpError(400, "Unsupported video format. Upload MP4, MOV, M4V, or WEBM only.");
+  }
+  if (!file.size || file.size <= 0) {
+    throw httpError(400, "Uploaded video is empty or corrupted.");
+  }
+}
+
+function isSupportedVideoUpload(file) {
+  const extension = path.extname(file.originalname || file.filename || "").toLowerCase();
+  const mime = String(file.mimetype || "").toLowerCase();
+  return supportedVideoExtensions.has(extension) && (supportedVideoMimeTypes.has(mime) || mime.startsWith("video/"));
+}
+
+function convertVideoToMp4(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-y",
+      "-i",
+      inputPath,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "22",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ];
+
+    const ffmpeg = spawn(ffmpegPath, args, { windowsHide: true });
+    let stderr = "";
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    ffmpeg.on("error", () => {
+      reject(httpError(500, "Video processor is not available on this server."));
+    });
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      console.warn("Video conversion failed:", stderr.slice(-800));
+      reject(httpError(400, "Could not process this video. Please upload a valid MP4, MOV, M4V, or WEBM file."));
+    });
+  });
+}
+
+function readVideoMetadata(videoPath) {
+  return new Promise((resolve) => {
+    const ffprobe = spawn(
+      ffprobePath,
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name",
+        "-of",
+        "json",
+        videoPath,
+      ],
+      { windowsHide: true },
+    );
+    let output = "";
+    ffprobe.stdout.on("data", (chunk) => {
+      output += chunk.toString();
+    });
+    ffprobe.on("error", () => resolve(emptyVideoMetadata()));
+    ffprobe.on("close", () => {
+      try {
+        const data = JSON.parse(output || "{}");
+        const streams = Array.isArray(data.streams) ? data.streams : [];
+        const videoStream = streams.find((stream) => stream.codec_type === "video");
+        const audioStream = streams.find((stream) => stream.codec_type === "audio");
+        const duration = Number.parseFloat(data.format?.duration);
+        resolve({
+          duration: formatVideoDurationFromSeconds(duration),
+          durationSeconds: Number.isFinite(duration) ? duration : 0,
+          hasVideo: Boolean(videoStream),
+          videoCodec: videoStream?.codec_name || "",
+          audioCodec: audioStream?.codec_name || "",
+        });
+      } catch {
+        resolve(emptyVideoMetadata());
+      }
+    });
+  });
+}
+
+function applyVideoMetadata(payload, metadata = {}) {
+  const duration = metadata.duration?.duration || metadata.durationHd?.duration || metadata.durationSd?.duration;
+  if (!duration) return;
+  if (!payload.duration || payload.duration === "00:00") {
+    payload.duration = duration;
+  }
+}
+
+async function validateStoredVideo(payload) {
+  if (!hasPlayableVideoSource(payload)) {
+    throw httpError(400, "Processed video source is missing.");
+  }
+
+  if (!isDbReady()) {
+    const filenames = [payload.videoPath, payload.videoPathHd, payload.videoPathSd].filter(Boolean);
+    for (const filename of filenames) {
+      const filePath = getSafeUploadPath(filename, videoUploadDir);
+      const stats = await fs.promises.stat(filePath).catch(() => null);
+      if (!stats?.size) throw httpError(400, "Processed video file is missing or empty.");
+    }
+    return;
+  }
+
+  const fileIds = [payload.videoFileId, payload.videoFileIdHd, payload.videoFileIdSd].filter(Boolean);
+  const bucket = getVideoGridFsBucket();
+  for (const fileId of fileIds) {
+    if (!mongoose.isValidObjectId(fileId)) throw httpError(400, "Stored video file id is invalid.");
+    const file = await bucket.find({ _id: new mongoose.Types.ObjectId(fileId) }).next();
+    if (!file?.length) throw httpError(400, "Stored video file is missing or empty.");
+    if (file.contentType !== "video/mp4") throw httpError(400, "Stored video is not MP4.");
+  }
+}
+
+async function recordProcessingFailure(payload, user, error, videoId = "") {
+  const message = error?.message || "Video processing failed.";
+  console.warn("Video upload/processing failure:", {
+    title: payload?.title || "",
+    userId: user?._id || user?.id || "",
+    videoId,
+    message,
+    at: new Date().toISOString(),
+  });
+
+  if (!payload?.title || !payload?.category) return;
+
+  const failedPayload = {
+    ...payload,
+    status: "rejected",
+    uploadStatus: "failed",
+    processingStatus: "failed",
+    processingError: message.slice(0, 500),
+    playbackHealthStatus: "failed",
+    playbackError: "Processing did not complete.",
+  };
+  applyUploadOwner(failedPayload, user);
+
+  try {
+    if (!isDbReady()) {
+      if (videoId) {
+        const index = memory.videos.findIndex((video) => video.id === videoId);
+        if (index !== -1) memory.videos[index] = { ...memory.videos[index], ...failedPayload };
+        return;
+      }
+      memory.videos.unshift({ id: cryptoId(), ...failedPayload });
+      return;
+    }
+
+    if (videoId && mongoose.isValidObjectId(videoId)) {
+      await Video.updateOne({ _id: videoId }, { $set: failedPayload });
+      return;
+    }
+
+    await Video.create(failedPayload);
+  } catch (saveError) {
+    console.warn("Could not save failed processing record:", saveError.message);
+  }
+}
+
+function emptyVideoMetadata() {
+  return {
+    duration: "",
+    durationSeconds: 0,
+    hasVideo: false,
+    videoCodec: "",
+    audioCodec: "",
+  };
+}
+
+function formatVideoDurationFromSeconds(value) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const totalSeconds = Math.round(value);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function applyUploadedFiles(payload, files = {}) {
@@ -1942,6 +2637,81 @@ function applyUploadedFiles(payload, files = {}) {
   if (videoSd) payload.videoPathSd = videoSd.filename;
 }
 
+async function persistUploadedVideoFiles(payload, files = {}) {
+  if (!isDbReady()) return;
+
+  const mappings = [
+    ["video", "videoFileId"],
+    ["videoHd", "videoFileIdHd"],
+    ["videoSd", "videoFileIdSd"],
+  ];
+
+  for (const [fieldName, payloadKey] of mappings) {
+    const file = files[fieldName]?.[0];
+    if (!file) continue;
+    payload[payloadKey] = await storeVideoFileInGridFs(file);
+  }
+}
+
+function storeVideoFileInGridFs(file) {
+  return new Promise((resolve, reject) => {
+    const bucket = getVideoGridFsBucket();
+    const uploadStream = bucket.openUploadStream(file.filename, {
+      contentType: file.mimetype || getVideoContentType(file.filename),
+      metadata: {
+        originalName: file.originalname || file.filename,
+        fieldName: file.fieldname,
+      },
+    });
+
+    fs.createReadStream(file.path)
+      .on("error", reject)
+      .pipe(uploadStream)
+      .on("error", reject)
+      .on("finish", () => resolve(String(uploadStream.id)));
+  });
+}
+
+async function backfillLocalVideosToGridFs() {
+  if (!isDbReady()) return;
+
+  const videos = await Video.find({
+    $or: [
+      { videoPath: { $ne: "" }, videoFileId: { $in: ["", null] } },
+      { videoPathHd: { $ne: "" }, videoFileIdHd: { $in: ["", null] } },
+      { videoPathSd: { $ne: "" }, videoFileIdSd: { $in: ["", null] } },
+    ],
+  })
+    .select("videoPath videoPathHd videoPathSd videoFileId videoFileIdHd videoFileIdSd")
+    .lean();
+
+  for (const video of videos) {
+    const updates = {};
+    await backfillGridFsField(video.videoPath, video.videoFileId, "video", "videoFileId", updates);
+    await backfillGridFsField(video.videoPathHd, video.videoFileIdHd, "videoHd", "videoFileIdHd", updates);
+    await backfillGridFsField(video.videoPathSd, video.videoFileIdSd, "videoSd", "videoFileIdSd", updates);
+
+    if (Object.keys(updates).length) {
+      await Video.updateOne({ _id: video._id }, { $set: updates });
+    }
+  }
+}
+
+async function backfillGridFsField(filename, currentFileId, fieldName, payloadKey, updates) {
+  if (!filename || currentFileId) return;
+
+  const filePath = getSafeUploadPath(filename, videoUploadDir);
+  if (!fs.existsSync(filePath)) return;
+
+  updates[payloadKey] = await storeVideoFileInGridFs({
+    path: filePath,
+    filename,
+    originalname: filename,
+    fieldname: fieldName,
+    mimetype: getVideoContentType(filename),
+  });
+}
+
 function validateVideoMedia(payload) {
   if (
     !payload.videoUrl &&
@@ -1949,7 +2719,10 @@ function validateVideoMedia(payload) {
     !payload.videoUrlSd &&
     !payload.videoPath &&
     !payload.videoPathHd &&
-    !payload.videoPathSd
+    !payload.videoPathSd &&
+    !payload.videoFileId &&
+    !payload.videoFileIdHd &&
+    !payload.videoFileIdSd
   ) {
     throw httpError(400, "Video file is required.");
   }
@@ -2025,12 +2798,12 @@ function generateVideoThumbnail(videoPath) {
       "-frames:v",
       "1",
       "-vf",
-      "scale=720:-2",
+      "scale=640:-2",
       "-q:v",
-      "4",
+      "5",
       outputPath,
     ];
-    const ffmpeg = spawn("ffmpeg", args, { windowsHide: true });
+    const ffmpeg = spawn(ffmpegPath, args, { windowsHide: true });
     const timer = setTimeout(() => {
       ffmpeg.kill("SIGKILL");
       cleanupGeneratedThumbnail(outputPath);
@@ -2065,17 +2838,36 @@ function cleanupGeneratedThumbnail(outputPath) {
 
 function getThumbnailUrl(video, request) {
   if (video.thumbnailUrl?.startsWith("data:image/")) return video.thumbnailUrl;
-  if (video.thumbnailUrl?.startsWith("http")) return video.thumbnailUrl;
+  if (video.thumbnailUrl?.startsWith("http")) return normalizeHttpsUrl(video.thumbnailUrl);
   if (video.thumbnailUrl?.startsWith("/uploads/")) {
-    return `${request.protocol}://${request.get("host")}${video.thumbnailUrl}`;
+    return `${getPublicBaseUrl(request)}${video.thumbnailUrl}`;
   }
   if (video.thumbnailPath) {
-    return `${request.protocol}://${request.get("host")}/uploads/thumbnails/${video.thumbnailPath}`;
+    return `${getPublicBaseUrl(request)}/uploads/thumbnails/${video.thumbnailPath}`;
   }
   if (video.videoPath || video.videoPathHd || video.videoPathSd || video.videoUrl || video.videoUrlHd || video.videoUrlSd) {
     return "";
   }
-  return `${request.protocol}://${request.get("host")}/assets/default-thumbnail.svg`;
+  return `${getPublicBaseUrl(request)}/assets/default-thumbnail.svg`;
+}
+
+function getPublicBaseUrl(request) {
+  const host = request.get("host");
+  const forwardedProtocol = String(request.get("x-forwarded-proto") || "").split(",")[0].trim();
+  const isLocalHost = host?.startsWith("localhost") || host?.startsWith("127.0.0.1");
+  const protocol = isLocalHost ? request.protocol : forwardedProtocol || "https";
+  return `${protocol}://${host}`;
+}
+
+function normalizeHttpsUrl(value = "") {
+  try {
+    const url = new URL(value);
+    const isLocalHost = ["localhost", "127.0.0.1"].includes(url.hostname);
+    if (url.protocol === "http:" && !isLocalHost) url.protocol = "https:";
+    return url.toString();
+  } catch {
+    return value;
+  }
 }
 
 function fileToDataUrlSync(filePath, mimeType = "image/jpeg") {
@@ -2129,6 +2921,52 @@ function streamLocalVideo(filePath, request, response) {
   fs.createReadStream(filePath, { start, end }).pipe(response);
 }
 
+async function streamGridFsVideo(fileId, request, response) {
+  if (!mongoose.Types.ObjectId.isValid(fileId)) {
+    throw httpError(404, "Video file not found.");
+  }
+
+  const bucket = getVideoGridFsBucket();
+  const objectId = new mongoose.Types.ObjectId(fileId);
+  const [file] = await bucket.find({ _id: objectId }).toArray();
+  if (!file) throw httpError(404, "Video file not found.");
+
+  const fileSize = file.length;
+  const range = request.headers.range;
+  response.setHeader("Content-Type", file.contentType || getVideoContentType(file.filename || ""));
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader("Cache-Control", "no-store, private");
+  response.setHeader("Content-Disposition", "inline");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+
+  if (!range) {
+    response.setHeader("Content-Length", fileSize);
+    bucket.openDownloadStream(objectId).pipe(response);
+    return;
+  }
+
+  const [startText, endText] = range.replace(/bytes=/, "").split("-");
+  const start = Number.parseInt(startText, 10);
+  const end = endText ? Number.parseInt(endText, 10) : fileSize - 1;
+
+  if (Number.isNaN(start) || Number.isNaN(end) || start >= fileSize || end >= fileSize) {
+    response.status(416).setHeader("Content-Range", `bytes */${fileSize}`);
+    response.end();
+    return;
+  }
+
+  response.status(206);
+  response.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+  response.setHeader("Content-Length", end - start + 1);
+  bucket.openDownloadStream(objectId, { start, end: end + 1 }).pipe(response);
+}
+
+function getVideoGridFsBucket() {
+  return new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
+    bucketName: "videoFiles",
+  });
+}
+
 function getVideoContentType(filePath) {
   const extension = path.extname(filePath).toLowerCase();
   if (extension === ".webm") return "video/webm";
@@ -2155,6 +2993,21 @@ function deleteUploadedFiles(video) {
     } catch {
       // Ignore cleanup errors; the database delete should not fail because a file is missing.
     }
+  }
+
+  deleteGridFsVideoFiles(video);
+}
+
+function deleteGridFsVideoFiles(video) {
+  if (!isDbReady()) return;
+
+  const bucket = getVideoGridFsBucket();
+  const fileIds = [video.videoFileId, video.videoFileIdHd, video.videoFileIdSd].filter(Boolean);
+  for (const fileId of fileIds) {
+    if (!mongoose.Types.ObjectId.isValid(fileId)) continue;
+    bucket.delete(new mongoose.Types.ObjectId(fileId)).catch(() => {
+      // Missing GridFS files should not block video deletion.
+    });
   }
 }
 
@@ -2244,6 +3097,7 @@ async function getPlan(planId = "premium") {
     name: plan.name,
     durationDays: plan.durationDays,
     amount: plan.amount,
+    originalAmount: plan.originalAmount,
     currency: "inr",
     razorpayAmount: plan.amount,
   };
