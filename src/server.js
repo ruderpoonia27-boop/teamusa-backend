@@ -2037,6 +2037,8 @@ function serializeVideo(video, isPremium, request) {
     thumbnailUrl: getThumbnailUrl(video, request),
     duration: isPremium || video.premiumOnly === false ? video.duration : "",
     views: video.views,
+    createdAt: video.createdAt || null,
+    uploadDate: video.createdAt || null,
     premiumOnly: video.premiumOnly,
     status: video.status,
     locked: Boolean(video.premiumOnly && !isPremium),
