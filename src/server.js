@@ -38,6 +38,8 @@ const supportedVideoMimeTypes = new Set([
   "video/webm",
   "application/octet-stream",
 ]);
+const activeProcessingJobs = new Set();
+const maxProcessingAttempts = 3;
 
 fs.mkdirSync(thumbnailUploadDir, { recursive: true });
 fs.mkdirSync(videoUploadDir, { recursive: true });
@@ -216,6 +218,12 @@ const videoSchema = new mongoose.Schema(
     videoFileId: { type: String, default: "" },
     videoFileIdHd: { type: String, default: "" },
     videoFileIdSd: { type: String, default: "" },
+    optimizedVideoPath: { type: String, default: "" },
+    optimizedVideoPathHd: { type: String, default: "" },
+    optimizedVideoPathSd: { type: String, default: "" },
+    optimizedVideoFileId: { type: String, default: "" },
+    optimizedVideoFileIdHd: { type: String, default: "" },
+    optimizedVideoFileIdSd: { type: String, default: "" },
     duration: { type: String, default: "00:00" },
     views: { type: Number, default: 0 },
     premiumOnly: { type: Boolean, default: true },
@@ -223,6 +231,7 @@ const videoSchema = new mongoose.Schema(
     uploadStatus: { type: String, enum: ["uploaded", "failed", ""], default: "" },
     processingStatus: { type: String, enum: ["pending", "processing", "ready", "failed", ""], default: "" },
     processingError: { type: String, default: "" },
+    processingAttempts: { type: Number, default: 0 },
     processedAt: { type: Date },
     playbackHealthStatus: { type: String, enum: ["unchecked", "passed", "failed", ""], default: "unchecked" },
     playbackCheckedAt: { type: Date },
@@ -235,6 +244,8 @@ const videoSchema = new mongoose.Schema(
 );
 
 videoSchema.index({ status: 1, createdAt: -1 });
+videoSchema.index({ status: 1, playbackHealthStatus: 1, createdAt: -1 });
+videoSchema.index({ status: 1, processingStatus: 1, createdAt: -1 });
 videoSchema.index({ status: 1, section: 1, createdAt: -1 });
 videoSchema.index({ status: 1, category: 1, createdAt: -1 });
 videoSchema.index({ uploadedBy: 1, createdAt: -1 });
@@ -365,26 +376,17 @@ app.get("/api/videos", optionalAuth, async (request, response, next) => {
 
     const videos = await Video.find({
       status: "approved",
-      $and: [
-        {
-          $or: [
-            { processingStatus: { $in: ["ready", ""] } },
-            { processingStatus: { $exists: false } },
-          ],
-        },
-        {
-          $or: [
-            { playbackHealthStatus: { $in: ["passed", "unchecked", ""] } },
-            { playbackHealthStatus: { $exists: false } },
-          ],
-        },
+      $or: [
+        { playbackHealthStatus: { $in: ["passed", "unchecked", ""] } },
+        { playbackHealthStatus: null },
+        { playbackHealthStatus: { $exists: false } },
       ],
     })
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit + 1)
       .select(
-        "title creator category section thumbnailUrl thumbnailPath videoUrl videoUrlHd videoUrlSd videoPath videoPathHd videoPathSd videoFileId videoFileIdHd videoFileIdSd duration views premiumOnly status createdAt",
+        "title creator category section thumbnailUrl thumbnailPath videoUrl videoUrlHd videoUrlSd videoPath videoPathHd videoPathSd videoFileId videoFileIdHd videoFileIdSd optimizedVideoPath optimizedVideoPathHd optimizedVideoPathSd optimizedVideoFileId optimizedVideoFileIdHd optimizedVideoFileIdSd duration views premiumOnly status processingStatus playbackHealthStatus createdAt",
       )
       .lean();
     const hasMore = videos.length > limit;
@@ -539,40 +541,26 @@ app.get("/api/videos/:id/stream", async (request, response, next) => {
       throw httpError(404, "Video not found.");
     }
 
-    const source = selectVideoSource(video, request.query.quality);
-    if (!source) throw httpError(404, "Video source missing.");
+    const sources = selectVideoSources(video, request.query.quality);
+    if (!sources.length) throw httpError(404, "Video source missing.");
 
-    if (source.type === "local") {
-      streamLocalVideo(source.path, request, response);
-      return;
+    let lastError = null;
+    for (const source of sources) {
+      try {
+        await streamVideoSource(source, request, response);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (response.headersSent) throw error;
+        console.warn("Video source fallback triggered:", {
+          videoId: request.params.id,
+          type: source.type,
+          message: error.message,
+        });
+      }
     }
 
-    if (source.type === "gridfs") {
-      await streamGridFsVideo(source.fileId, request, response);
-      return;
-    }
-
-    const upstream = await fetch(source.url, {
-      headers: request.headers.range ? { Range: request.headers.range } : {},
-    });
-
-    if (!upstream.ok && upstream.status !== 206) {
-      throw httpError(502, "Video source unavailable.");
-    }
-
-    response.status(upstream.status);
-    response.setHeader("Content-Type", upstream.headers.get("content-type") || "video/mp4");
-    response.setHeader("Accept-Ranges", upstream.headers.get("accept-ranges") || "bytes");
-    response.setHeader("Cache-Control", "no-store, private");
-    response.setHeader("Content-Disposition", "inline");
-    response.setHeader("X-Content-Type-Options", "nosniff");
-
-    const contentLength = upstream.headers.get("content-length");
-    const contentRange = upstream.headers.get("content-range");
-    if (contentLength) response.setHeader("Content-Length", contentLength);
-    if (contentRange) response.setHeader("Content-Range", contentRange);
-
-    Readable.fromWeb(upstream.body).pipe(response);
+    throw lastError || httpError(404, "Video source unavailable.");
   } catch (error) {
     next(error);
   }
@@ -613,16 +601,14 @@ app.post("/api/admin/videos", requireContentManager, upload.fields(getUploadFiel
   let payload;
   try {
     payload = readVideoInput(request.body);
-    markVideoProcessing(payload);
-    const mediaMetadata = await processUploadedVideoFiles(request.files);
+    markVideoUploaded(payload);
+    const mediaMetadata = await inspectUploadedVideoFiles(request.files);
     applyUploadedFiles(payload, request.files);
     applyVideoMetadata(payload, mediaMetadata);
     await persistUploadedVideoFiles(payload, request.files);
     validateVideoMedia(payload);
     await validateStoredVideo(payload);
-    await ensureVideoThumbnail(payload);
     applyUploadOwner(payload, request.user);
-    markVideoReady(payload);
 
     if (!isDbReady()) {
       const video = {
@@ -633,12 +619,14 @@ app.post("/api/admin/videos", requireContentManager, upload.fields(getUploadFiel
         ...payload,
       };
       memory.videos.unshift(video);
-    response.status(201).json({ video: serializeAdminVideo(video, request) });
-    return;
-  }
+      response.status(201).json({ video: serializeAdminVideo(video, request) });
+      queueVideoOptimization(video.id);
+      return;
+    }
 
-  const video = await Video.create(payload);
-  response.status(201).json({ video: serializeAdminVideo(video.toObject(), request) });
+    const video = await Video.create(payload);
+    response.status(201).json({ video: serializeAdminVideo(video.toObject(), request) });
+    queueVideoOptimization(String(video._id));
   } catch (error) {
     await recordProcessingFailure(payload, request.user, error);
     next(error);
@@ -650,8 +638,8 @@ app.patch("/api/admin/videos/:id", requireContentManager, upload.fields(getUploa
   try {
     payload = readVideoInput(request.body, { partial: true });
     const hasNewMedia = hasUploadedVideoFiles(request.files);
-    if (hasNewMedia) markVideoProcessing(payload);
-    const mediaMetadata = await processUploadedVideoFiles(request.files);
+    if (hasNewMedia) markVideoUploaded(payload);
+    const mediaMetadata = await inspectUploadedVideoFiles(request.files);
     applyUploadedFiles(payload, request.files);
     applyVideoMetadata(payload, mediaMetadata);
     await persistUploadedVideoFiles(payload, request.files);
@@ -659,8 +647,6 @@ app.patch("/api/admin/videos/:id", requireContentManager, upload.fields(getUploa
       validateVideoMedia(payload);
       await validateStoredVideo(payload);
     }
-    await ensureVideoThumbnail(payload);
-    if (hasNewMedia) markVideoReady(payload);
 
     if (!isDbReady()) {
       const index = memory.videos.findIndex((video) => video.id === request.params.id);
@@ -668,6 +654,7 @@ app.patch("/api/admin/videos/:id", requireContentManager, upload.fields(getUploa
       if (!canManageVideo(request.user, memory.videos[index])) throw httpError(403, "You can only manage your own videos.");
       memory.videos[index] = { ...memory.videos[index], ...payload };
       response.json({ video: serializeAdminVideo(memory.videos[index], request) });
+      if (hasNewMedia) queueVideoOptimization(request.params.id);
       return;
     }
 
@@ -680,6 +667,7 @@ app.patch("/api/admin/videos/:id", requireContentManager, upload.fields(getUploa
     });
     if (!video) throw httpError(404, "Video not found.");
     response.json({ video: serializeAdminVideo(video.toObject(), request) });
+    if (hasNewMedia) queueVideoOptimization(String(video._id));
   } catch (error) {
     await recordProcessingFailure(payload, request.user, error, request.params.id);
     next(error);
@@ -825,7 +813,7 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
 app.get("/api/payment-settings", async (request, response, next) => {
   try {
     const settings = await getPaymentSettings();
-    response.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
+    response.setHeader("Cache-Control", "no-store");
     response.json({ settings: serializePaymentSettings(settings, request) });
   } catch (error) {
     next(error);
@@ -1078,6 +1066,11 @@ async function start() {
       } catch (error) {
         console.warn("Could not backfill local videos to GridFS:", error.message);
       }
+      try {
+        await resumePendingVideoProcessing();
+      } catch (error) {
+        console.warn("Could not resume pending video processing:", error.message);
+      }
       console.log("MongoDB connected");
     } catch (error) {
       console.error(`MongoDB connection failed: ${error.message}`);
@@ -1208,6 +1201,17 @@ function validateStableMediaUrls(payload = {}) {
   }
 }
 
+function markVideoUploaded(payload) {
+  payload.status = "approved";
+  payload.uploadStatus = "uploaded";
+  payload.processingStatus = "pending";
+  payload.processingError = "";
+  payload.processingAttempts = 0;
+  payload.playbackHealthStatus = "passed";
+  payload.playbackError = "";
+  payload.playbackCheckedAt = new Date();
+}
+
 function markVideoProcessing(payload) {
   payload.status = "pending";
   payload.uploadStatus = "uploaded";
@@ -1235,7 +1239,6 @@ function hasUploadedVideoFiles(files = {}) {
 function isPublicVideoReady(video) {
   return (
     video.status === "approved" &&
-    (!video.processingStatus || video.processingStatus === "ready") &&
     (!video.playbackHealthStatus || ["passed", "unchecked"].includes(video.playbackHealthStatus)) &&
     hasPlayableVideoSource(video)
   );
@@ -2056,8 +2059,10 @@ function serializeAdminVideo(video, request) {
     uploadedByRole: video.uploadedByRole || "",
     thumbnailUrl: getThumbnailUrl(video, request),
     sourceType:
-      video.videoPath || video.videoPathHd || video.videoPathSd || video.videoFileId || video.videoFileIdHd || video.videoFileIdSd
-        ? "Uploaded file"
+      video.optimizedVideoPath || video.optimizedVideoPathHd || video.optimizedVideoPathSd || video.optimizedVideoFileId || video.optimizedVideoFileIdHd || video.optimizedVideoFileIdSd
+        ? "Optimized MP4"
+        : video.videoPath || video.videoPathHd || video.videoPathSd || video.videoFileId || video.videoFileIdHd || video.videoFileIdSd
+          ? "Original upload"
         : "External URL",
     sourceMissing: !hasPlayableVideoSource(video),
   };
@@ -2288,18 +2293,8 @@ function hasPlayableVideoSource(video) {
 }
 
 function hasVideoSourceForQuality(video, quality) {
-  const localFilename =
-    quality === "sd"
-      ? video.videoPathSd || video.videoPath
-      : quality === "hd"
-        ? video.videoPathHd || video.videoPath
-        : video.videoPathHd || video.videoPath || video.videoPathSd;
-  const gridFileId =
-    quality === "sd"
-      ? video.videoFileIdSd || video.videoFileId
-      : quality === "hd"
-        ? video.videoFileIdHd || video.videoFileId
-        : video.videoFileIdHd || video.videoFileId || video.videoFileIdSd;
+  const localFilenames = getLocalSourceCandidates(video, quality);
+  const gridFileIds = getGridSourceCandidates(video, quality);
   const remoteUrl =
     quality === "sd"
       ? video.videoUrlSd || video.videoUrl
@@ -2308,36 +2303,29 @@ function hasVideoSourceForQuality(video, quality) {
         : video.videoUrlHd || video.videoUrl || video.videoUrlSd;
 
   return Boolean(
-    (localFilename && fs.existsSync(getSafeUploadPath(localFilename, videoUploadDir))) ||
-      gridFileId ||
+    localFilenames.some((filename) => filename && fs.existsSync(getSafeUploadPath(filename, videoUploadDir))) ||
+      gridFileIds.some(Boolean) ||
       isStableHttpsMediaUrl(remoteUrl),
   );
 }
 
 function selectVideoSource(video, quality) {
-  const localFilename =
-    quality === "sd"
-      ? video.videoPathSd || video.videoPath
-      : quality === "hd"
-        ? video.videoPathHd || video.videoPath
-        : video.videoPathHd || video.videoPath || video.videoPathSd;
+  return selectVideoSources(video, quality)[0] || null;
+}
 
-  if (localFilename) {
+function selectVideoSources(video, quality) {
+  const sources = [];
+
+  for (const localFilename of getLocalSourceCandidates(video, quality)) {
+    if (!localFilename) continue;
     const localPath = getSafeUploadPath(localFilename, videoUploadDir);
     if (fs.existsSync(localPath)) {
-      return { type: "local", path: localPath };
+      sources.push({ type: "local", path: localPath });
     }
   }
 
-  const gridFileId =
-    quality === "sd"
-      ? video.videoFileIdSd || video.videoFileId
-      : quality === "hd"
-        ? video.videoFileIdHd || video.videoFileId
-        : video.videoFileIdHd || video.videoFileId || video.videoFileIdSd;
-
-  if (gridFileId) {
-    return { type: "gridfs", fileId: gridFileId };
+  for (const gridFileId of getGridSourceCandidates(video, quality)) {
+    if (gridFileId) sources.push({ type: "gridfs", fileId: gridFileId });
   }
 
   const url =
@@ -2347,7 +2335,55 @@ function selectVideoSource(video, quality) {
         ? video.videoUrlHd || video.videoUrl
         : video.videoUrlHd || video.videoUrl || video.videoUrlSd;
 
-  return isStableHttpsMediaUrl(url) ? { type: "remote", url: normalizeHttpsUrl(url) } : null;
+  if (isStableHttpsMediaUrl(url)) {
+    sources.push({ type: "remote", url: normalizeHttpsUrl(url) });
+  }
+
+  return dedupeVideoSources(sources);
+}
+
+function dedupeVideoSources(sources) {
+  const seen = new Set();
+  return sources.filter((source) => {
+    const key = `${source.type}:${source.path || source.fileId || source.url}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getLocalSourceCandidates(video, quality) {
+  if (quality === "sd") {
+    return [video.optimizedVideoPathSd, video.videoPathSd, video.optimizedVideoPath, video.videoPath];
+  }
+  if (quality === "hd") {
+    return [video.optimizedVideoPathHd, video.videoPathHd, video.optimizedVideoPath, video.videoPath];
+  }
+  return [
+    video.optimizedVideoPathHd,
+    video.optimizedVideoPath,
+    video.videoPathHd,
+    video.videoPath,
+    video.optimizedVideoPathSd,
+    video.videoPathSd,
+  ];
+}
+
+function getGridSourceCandidates(video, quality) {
+  if (quality === "sd") {
+    return [video.optimizedVideoFileIdSd, video.videoFileIdSd, video.optimizedVideoFileId, video.videoFileId];
+  }
+  if (quality === "hd") {
+    return [video.optimizedVideoFileIdHd, video.videoFileIdHd, video.optimizedVideoFileId, video.videoFileId];
+  }
+  return [
+    video.optimizedVideoFileIdHd,
+    video.optimizedVideoFileId,
+    video.videoFileIdHd,
+    video.videoFileId,
+    video.optimizedVideoFileIdSd,
+    video.videoFileIdSd,
+  ];
 }
 
 function isStableHttpsMediaUrl(value = "") {
@@ -2376,7 +2412,7 @@ function getUploadFields() {
   ];
 }
 
-async function processUploadedVideoFiles(files = {}) {
+async function inspectUploadedVideoFiles(files = {}) {
   const metadata = {};
   const mappings = [
     ["video", "duration"],
@@ -2388,39 +2424,20 @@ async function processUploadedVideoFiles(files = {}) {
     const file = files[fieldName]?.[0];
     if (!file) continue;
     validateVideoUpload(file);
-    metadata[metadataKey] = await processVideoUpload(file);
+    metadata[metadataKey] = await inspectVideoUpload(file);
   }
 
   return metadata;
 }
 
-async function processVideoUpload(file) {
-  const originalPath = file.path;
-  const outputFilename = `${path.basename(file.filename, path.extname(file.filename))}-processed.mp4`;
-  const outputPath = path.join(videoUploadDir, outputFilename);
+async function inspectVideoUpload(file) {
+  const stats = await fs.promises.stat(file.path).catch(() => null);
+  if (!stats?.size) throw httpError(400, "Uploaded video is empty or corrupted.");
 
-  await convertVideoToMp4(originalPath, outputPath);
-
-  const stats = await fs.promises.stat(outputPath);
-  if (!stats.size) {
-    throw httpError(400, "Video conversion failed. Please upload a valid MP4, MOV, M4V, or WEBM file.");
+  const metadata = await readVideoMetadata(file.path);
+  if (!metadata.hasVideo) {
+    throw httpError(400, "Uploaded video is corrupted or missing a valid video stream.");
   }
-
-  if (outputPath !== originalPath && fs.existsSync(originalPath)) {
-    await fs.promises.unlink(originalPath).catch(() => {});
-  }
-
-  file.filename = outputFilename;
-  file.path = outputPath;
-  file.destination = videoUploadDir;
-  file.mimetype = "video/mp4";
-  file.size = stats.size;
-
-  const metadata = await readVideoMetadata(outputPath);
-  if (!metadata.hasVideo || metadata.videoCodec !== "h264") {
-    throw httpError(400, "Processed video failed compatibility checks.");
-  }
-
   return metadata;
 }
 
@@ -2516,6 +2533,7 @@ function readVideoMetadata(videoPath) {
           duration: formatVideoDurationFromSeconds(duration),
           durationSeconds: Number.isFinite(duration) ? duration : 0,
           hasVideo: Boolean(videoStream),
+          hasAudio: Boolean(audioStream),
           videoCodec: videoStream?.codec_name || "",
           audioCodec: audioStream?.codec_name || "",
         });
@@ -2555,8 +2573,238 @@ async function validateStoredVideo(payload) {
     if (!mongoose.isValidObjectId(fileId)) throw httpError(400, "Stored video file id is invalid.");
     const file = await bucket.find({ _id: new mongoose.Types.ObjectId(fileId) }).next();
     if (!file?.length) throw httpError(400, "Stored video file is missing or empty.");
-    if (file.contentType !== "video/mp4") throw httpError(400, "Stored video is not MP4.");
+    if (!String(file.contentType || "").startsWith("video/")) {
+      throw httpError(400, "Stored file is not a video.");
+    }
   }
+}
+
+function queueVideoOptimization(videoId, delayMs = 0) {
+  if (!videoId) return;
+  const key = String(videoId);
+  if (activeProcessingJobs.has(key)) return;
+
+  setTimeout(async () => {
+    if (activeProcessingJobs.has(key)) return;
+    activeProcessingJobs.add(key);
+    try {
+      await processVideoOptimization(key);
+    } catch (error) {
+      console.warn("Background video optimization failed:", {
+        videoId: key,
+        message: error.message,
+        at: new Date().toISOString(),
+      });
+    } finally {
+      activeProcessingJobs.delete(key);
+    }
+  }, delayMs);
+}
+
+async function resumePendingVideoProcessing() {
+  if (!isDbReady()) return;
+  const pendingVideos = await Video.find({
+    status: "approved",
+    processingStatus: { $in: ["pending", "processing"] },
+  })
+    .select("_id")
+    .limit(25)
+    .lean();
+
+  for (const video of pendingVideos) {
+    queueVideoOptimization(String(video._id), 1500);
+  }
+}
+
+async function processVideoOptimization(videoId) {
+  const video = await findMutableVideo(videoId);
+  if (!video) return;
+
+  const attempt = Number(video.processingAttempts || 0) + 1;
+  await updateVideoProcessing(videoId, {
+    processingStatus: "processing",
+    processingError: "",
+    processingAttempts: attempt,
+  });
+
+  try {
+    const updates = {};
+    const metadata = await optimizeVideoSources(video, updates);
+
+    if (metadata.duration && (!video.duration || video.duration === "00:00")) {
+      updates.duration = metadata.duration;
+    }
+
+    const thumbnailUpdates = await ensureOptimizedThumbnail({ ...video, ...updates });
+    Object.assign(updates, thumbnailUpdates);
+
+    Object.assign(updates, {
+      status: "approved",
+      uploadStatus: "uploaded",
+      processingStatus: "ready",
+      processingError: "",
+      playbackHealthStatus: "passed",
+      playbackError: "",
+      processedAt: new Date(),
+      playbackCheckedAt: new Date(),
+    });
+
+    await updateVideoProcessing(videoId, updates);
+  } catch (error) {
+    const hasFallback = hasPlayableVideoSource(video);
+    const updates = {
+      status: hasFallback ? "approved" : "rejected",
+      processingStatus: "failed",
+      processingError: error.message.slice(0, 500),
+      playbackHealthStatus: hasFallback ? "passed" : "failed",
+      playbackError: hasFallback ? "" : "No playable fallback source is available.",
+      playbackCheckedAt: new Date(),
+    };
+    await updateVideoProcessing(videoId, updates);
+
+    if (attempt < maxProcessingAttempts) {
+      queueVideoOptimization(videoId, 30000 * attempt);
+    }
+  }
+}
+
+async function optimizeVideoSources(video, updates) {
+  const fields = [
+    {
+      pathKey: "videoPath",
+      fileIdKey: "videoFileId",
+      optimizedPathKey: "optimizedVideoPath",
+      optimizedFileIdKey: "optimizedVideoFileId",
+      uploadField: "videoOptimized",
+    },
+    {
+      pathKey: "videoPathHd",
+      fileIdKey: "videoFileIdHd",
+      optimizedPathKey: "optimizedVideoPathHd",
+      optimizedFileIdKey: "optimizedVideoFileIdHd",
+      uploadField: "videoHdOptimized",
+    },
+    {
+      pathKey: "videoPathSd",
+      fileIdKey: "videoFileIdSd",
+      optimizedPathKey: "optimizedVideoPathSd",
+      optimizedFileIdKey: "optimizedVideoFileIdSd",
+      uploadField: "videoSdOptimized",
+    },
+  ];
+  let firstMetadata = emptyVideoMetadata();
+  let processedAny = false;
+
+  for (const field of fields) {
+    if (video[field.optimizedPathKey] || video[field.optimizedFileIdKey]) continue;
+    if (!video[field.pathKey] && !video[field.fileIdKey]) continue;
+
+    const sourcePath = await resolveProcessingSource(video[field.pathKey], video[field.fileIdKey]);
+    const sourceMetadata = await readVideoMetadata(sourcePath);
+    if (!sourceMetadata.hasVideo) throw httpError(400, "Uploaded video is missing a valid video stream.");
+    if (!firstMetadata.duration) firstMetadata = sourceMetadata;
+
+    if (isStreamingOptimizedSource(sourcePath, sourceMetadata)) {
+      processedAny = true;
+      continue;
+    }
+
+    const optimizedFilename = `${path.basename(video[field.pathKey] || `${field.uploadField}-${cryptoId()}`, path.extname(video[field.pathKey] || ""))}-optimized.mp4`;
+    const optimizedPath = path.join(videoUploadDir, optimizedFilename);
+    await convertVideoToMp4(sourcePath, optimizedPath);
+    const optimizedMetadata = await readVideoMetadata(optimizedPath);
+    if (!isStreamingOptimizedSource(optimizedPath, optimizedMetadata)) {
+      throw httpError(400, "Optimized video failed compatibility checks.");
+    }
+
+    updates[field.optimizedPathKey] = optimizedFilename;
+    if (isDbReady()) {
+      updates[field.optimizedFileIdKey] = await storeVideoFileInGridFs({
+        path: optimizedPath,
+        filename: optimizedFilename,
+        originalname: optimizedFilename,
+        fieldname: field.uploadField,
+        mimetype: "video/mp4",
+      });
+    }
+    processedAny = true;
+  }
+
+  if (!processedAny) throw httpError(400, "No source video was available for optimization.");
+  return firstMetadata;
+}
+
+async function resolveProcessingSource(filename, fileId) {
+  if (filename) {
+    const localPath = getSafeUploadPath(filename, videoUploadDir);
+    if (fs.existsSync(localPath)) return localPath;
+  }
+
+  if (!isDbReady() || !fileId || !mongoose.isValidObjectId(fileId)) {
+    throw httpError(404, "Original source is unavailable for processing.");
+  }
+
+  const bucket = getVideoGridFsBucket();
+  const objectId = new mongoose.Types.ObjectId(fileId);
+  const file = await bucket.find({ _id: objectId }).next();
+  if (!file) throw httpError(404, "Original source is missing from storage.");
+
+  const extension = path.extname(file.filename || "") || ".mp4";
+  const restoredFilename = `${Date.now()}-${cryptoId()}-restored${extension}`;
+  const restoredPath = path.join(videoUploadDir, restoredFilename);
+  await new Promise((resolve, reject) => {
+    bucket
+      .openDownloadStream(objectId)
+      .pipe(fs.createWriteStream(restoredPath))
+      .on("error", reject)
+      .on("finish", resolve);
+  });
+  return restoredPath;
+}
+
+function isStreamingOptimizedSource(sourcePath, metadata) {
+  const extension = path.extname(sourcePath).toLowerCase();
+  return (
+    extension === ".mp4" &&
+    metadata.hasVideo &&
+    metadata.videoCodec === "h264" &&
+    (!metadata.hasAudio || metadata.audioCodec === "aac")
+  );
+}
+
+async function ensureOptimizedThumbnail(video) {
+  if (hasVideoThumbnail(video)) return {};
+  const sourcePath = await resolveProcessingSource(
+    video.optimizedVideoPath || video.videoPath || video.videoPathHd || video.videoPathSd,
+    video.optimizedVideoFileId || video.videoFileId || video.videoFileIdHd || video.videoFileIdSd,
+  ).catch(() => "");
+  if (!sourcePath) return {};
+  const generated = await generateVideoThumbnail(sourcePath);
+  if (!generated) return {};
+  return {
+    thumbnailPath: generated.filename,
+    thumbnailUrl: generated.dataUrl,
+  };
+}
+
+async function findMutableVideo(videoId) {
+  if (!videoId) return null;
+  if (!isDbReady()) {
+    return memory.videos.find((video) => String(video.id) === String(videoId)) || null;
+  }
+  if (!mongoose.isValidObjectId(videoId)) return null;
+  return Video.findById(videoId).lean();
+}
+
+async function updateVideoProcessing(videoId, updates) {
+  if (!videoId || !updates || !Object.keys(updates).length) return;
+  if (!isDbReady()) {
+    const index = memory.videos.findIndex((video) => String(video.id) === String(videoId));
+    if (index !== -1) memory.videos[index] = { ...memory.videos[index], ...updates };
+    return;
+  }
+  if (!mongoose.isValidObjectId(videoId)) return;
+  await Video.updateOne({ _id: videoId }, { $set: updates });
 }
 
 async function recordProcessingFailure(payload, user, error, videoId = "") {
@@ -2609,6 +2857,7 @@ function emptyVideoMetadata() {
     duration: "",
     durationSeconds: 0,
     hasVideo: false,
+    hasAudio: false,
     videoCodec: "",
     audioCodec: "",
   };
@@ -2634,9 +2883,21 @@ function applyUploadedFiles(payload, files = {}) {
     payload.thumbnailPath = thumbnail.filename;
     payload.thumbnailUrl = fileToDataUrlSync(thumbnail.path, thumbnail.mimetype);
   }
-  if (video) payload.videoPath = video.filename;
-  if (videoHd) payload.videoPathHd = videoHd.filename;
-  if (videoSd) payload.videoPathSd = videoSd.filename;
+  if (video) {
+    payload.videoPath = video.filename;
+    payload.optimizedVideoPath = "";
+    payload.optimizedVideoFileId = "";
+  }
+  if (videoHd) {
+    payload.videoPathHd = videoHd.filename;
+    payload.optimizedVideoPathHd = "";
+    payload.optimizedVideoFileIdHd = "";
+  }
+  if (videoSd) {
+    payload.videoPathSd = videoSd.filename;
+    payload.optimizedVideoPathSd = "";
+    payload.optimizedVideoFileIdSd = "";
+  }
 }
 
 async function persistUploadedVideoFiles(payload, files = {}) {
@@ -2886,6 +3147,25 @@ function getSafeUploadPath(filename, root) {
   return resolved;
 }
 
+async function streamVideoSource(source, request, response) {
+  if (source.type === "local") {
+    streamLocalVideo(source.path, request, response);
+    return;
+  }
+
+  if (source.type === "gridfs") {
+    await streamGridFsVideo(source.fileId, request, response);
+    return;
+  }
+
+  if (source.type === "remote") {
+    await streamRemoteVideo(source.url, request, response);
+    return;
+  }
+
+  throw httpError(404, "Video source missing.");
+}
+
 function streamLocalVideo(filePath, request, response) {
   if (!fs.existsSync(filePath)) {
     throw httpError(404, "Video file not found.");
@@ -2963,6 +3243,30 @@ async function streamGridFsVideo(fileId, request, response) {
   bucket.openDownloadStream(objectId, { start, end: end + 1 }).pipe(response);
 }
 
+async function streamRemoteVideo(url, request, response) {
+  const upstream = await fetch(url, {
+    headers: request.headers.range ? { Range: request.headers.range } : {},
+  });
+
+  if (!upstream.ok && upstream.status !== 206) {
+    throw httpError(502, "Video source unavailable.");
+  }
+
+  response.status(upstream.status);
+  response.setHeader("Content-Type", upstream.headers.get("content-type") || "video/mp4");
+  response.setHeader("Accept-Ranges", upstream.headers.get("accept-ranges") || "bytes");
+  response.setHeader("Cache-Control", "no-store, private");
+  response.setHeader("Content-Disposition", "inline");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+
+  const contentLength = upstream.headers.get("content-length");
+  const contentRange = upstream.headers.get("content-range");
+  if (contentLength) response.setHeader("Content-Length", contentLength);
+  if (contentRange) response.setHeader("Content-Range", contentRange);
+
+  Readable.fromWeb(upstream.body).pipe(response);
+}
+
 function getVideoGridFsBucket() {
   return new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
     bucketName: "videoFiles",
@@ -2985,6 +3289,9 @@ function deleteUploadedFiles(video) {
     [video.videoPath, videoUploadDir],
     [video.videoPathHd, videoUploadDir],
     [video.videoPathSd, videoUploadDir],
+    [video.optimizedVideoPath, videoUploadDir],
+    [video.optimizedVideoPathHd, videoUploadDir],
+    [video.optimizedVideoPathSd, videoUploadDir],
   ];
 
   for (const [filename, root] of files) {
@@ -3004,7 +3311,14 @@ function deleteGridFsVideoFiles(video) {
   if (!isDbReady()) return;
 
   const bucket = getVideoGridFsBucket();
-  const fileIds = [video.videoFileId, video.videoFileIdHd, video.videoFileIdSd].filter(Boolean);
+  const fileIds = [
+    video.videoFileId,
+    video.videoFileIdHd,
+    video.videoFileIdSd,
+    video.optimizedVideoFileId,
+    video.optimizedVideoFileIdHd,
+    video.optimizedVideoFileIdSd,
+  ].filter(Boolean);
   for (const fileId of fileIds) {
     if (!mongoose.Types.ObjectId.isValid(fileId)) continue;
     bucket.delete(new mongoose.Types.ObjectId(fileId)).catch(() => {
